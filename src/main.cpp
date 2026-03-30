@@ -274,7 +274,7 @@ void loop() {
 
   static float tempC_0, tempF_0;
   static int rawFuelADC, rawBattADC;
-  static float voltsFuelADC, voltsBattADC;
+  static float voltsFuelADC, voltsBattADC, battVoltage, battVoltageCalc;
   static int percentFuel;
   static bool sendData = false;
 
@@ -498,6 +498,13 @@ void loop() {
     float fuelCalc = (-90.21 * voltsFuelADC) + 105.55;
     percentFuel = (int)fuelCalc;
 
+    // Calculate batter voltage
+    float R2 = 1000000.0; // 1M ohm resistor
+    float R3 = 1000000.0; // 1M ohm resistor
+    float BatteryScalingFactor = 5.2 / 4.8; // Adjust for voltage divider and ADC reference
+    battVoltageCalc = voltsBattADC * ((R2 + R3) / R3) * BatteryScalingFactor; // Voltage divider formula
+    battVoltage = battVoltageCalc;
+
     // Limit percentFuel to 0-100 range
     if (percentFuel > 100) percentFuel = 100;
     if (percentFuel < 0) percentFuel = 0;
@@ -513,7 +520,9 @@ void loop() {
     if ((dataChanged || resendAfterMissedHeartbeat) && intervalElapsed) {
 
       // Update previous values
-      prevBattVoltage = voltsBattADC;
+      //prevBattVoltage = voltsBattADC;
+      prevBattVoltage = battVoltage;
+
       prevAirTemperature = tempF_0;
       prevFuelLevel = (float)percentFuel;
       prevModeHeadLights = modeHeadLights;
@@ -522,7 +531,8 @@ void loop() {
       dataToGcd.modeLights = modeHeadLights;
       dataToGcd.outdoorLum = outdoorLuminosity;
       dataToGcd.airTemp = tempF_0;
-      dataToGcd.battVolts = voltsBattADC;
+      //dataToGcd.battVolts = voltsBattADC;
+      dataToGcd.battVolts = battVoltage;
       dataToGcd.fuel = percentFuel;
 
       sendData = true;
@@ -559,7 +569,8 @@ void loop() {
     displayTempLine(tft, tempF_0, sensorConnected);
 
     // Display fuel and battery
-    displayFuelBattLine(tft, voltsFuelADC, voltsBattADC);
+    //displayFuelBattLine(tft, voltsFuelADC, voltsBattADC);
+    displayFuelBattLine(tft, voltsFuelADC, battVoltage);
 
     // Print compressed telemetry format to serial
     char gcdMacStr[18];
@@ -570,7 +581,7 @@ void loop() {
     }
     Serial.printf("Telemetry to %s : Lights=%d, Lum=%d, Temp=%.1f, Batt=%.2f, Fuel=%.1f\n",
                   hasPeer ? gcdMacStr : "No Peer",
-                  modeHeadLights, outdoorLuminosity, tempF_0, voltsBattADC, (float)percentFuel);
+                  modeHeadLights, outdoorLuminosity, tempF_0, battVoltage, (float)percentFuel);
 
     sendData = false; // Reset flag after display update
   }
