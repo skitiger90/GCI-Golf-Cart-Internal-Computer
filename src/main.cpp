@@ -103,10 +103,10 @@ int modeHeadLights = -99;
 int outdoorLuminosity = -99;
 float airTemperature = -99;
 float battVoltage = -99;
-float fuelLevel = -99;
+float fuelLevel = 100.0f;  // this is set to 100 to prevent false "low fuel" warnings on GCD before we have a valid reading
 
 // Fuel level smoothing state
-float smoothedFuel = -99.0f;              // value transmitted to GCD; -99 = no valid data
+float smoothedFuel = 100.0f;              // value transmitted to GCD; defaults to 100 until valid data received
 float fuelSampleBuf[FUEL_SAMPLE_COUNT];   // rolling sample buffer
 int   fuelSampleIdx = 0;
 bool  fuelSampleFull = false;
@@ -116,7 +116,7 @@ unsigned long lastFuelSampleTime = 0;
 int prevModeHeadLights = -99;
 float prevAirTemperature = -999;
 float prevBattVoltage = -99;
-float prevFuelLevel = -99;
+float prevFuelLevel = 100.0f;
 
 // Status variables received from GCD
 bool is_home = false;      // True when GCD is within home geo-fence
@@ -557,7 +557,7 @@ void loop() {
 
     // Collect timed fuel sample into rolling buffer for variance-based filtering.
     // Accepts a reading only when >= FUEL_MIN_SAMPLES have been gathered and variance
-    // is low (stable sensor).  High variance = sloshing or no sensor installed → -99.
+    // is low (stable sensor).  High variance = sloshing or no sensor → hold 100 (no false low warnings).
     if (millis() - lastFuelSampleTime >= FUEL_SAMPLE_INTERVAL_MS) {
       lastFuelSampleTime = millis();
 
@@ -582,7 +582,7 @@ void loop() {
         if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
           smoothedFuel = mean;
         else
-          smoothedFuel = -99.0f;  // too few samples, too much variance, or no sensor
+          smoothedFuel = 100.0f;  // too few samples or too much variance — hold 100 to suppress false low warnings
       }
     }
 
