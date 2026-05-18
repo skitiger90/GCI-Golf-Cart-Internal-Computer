@@ -82,21 +82,32 @@ void displayTempLine(TFT_eSPI &tft, float tempF, bool sensorConnected) {
 }
 
 void displayFuelBattLine(TFT_eSPI &tft, float fuelVolts, float battVolts) {
-    // Clear the value area
-    tft.fillRect(60, FUEL_LINE_Y, 260, 18, TFT_BLACK);
+    // Clear the full fuel/batt area (two font-2 lines tall = ~32px)
+    tft.fillRect(0, FUEL_LINE_Y, SCREEN_WIDTH, SCREEN_HEIGHT - FUEL_LINE_Y, TFT_BLACK);
 
-    // Draw FUEL
+    // FUEL label stacked: "FUEL" over "VOLT"
+    setLabelStyle(tft);
     tft.setCursor(1, FUEL_LINE_Y);
-    setLabelStyle(tft);
-    tft.print("FUEL ");
-    setValueStyle(tft);
-    tft.print(fuelVolts, 3);  // 3 decimal places
+    tft.print("FUEL");
+    tft.setCursor(1, FUEL_LINE_Y + 16);
+    tft.print("VOLT");
 
-    // Draw BATT
-    setLabelStyle(tft);
-    tft.print("     BATT ");
+    // Fuel value — font 4 (26px tall) centered against the 32px stacked label
     setValueStyle(tft);
-    tft.print(battVolts, 3);  // 3 decimal places
+    tft.setCursor(40, FUEL_LINE_Y + 3);
+    tft.print(fuelVolts, 3);
+
+    // BATT label stacked: "BATT" over "VOLT"
+    setLabelStyle(tft);
+    tft.setCursor(130, FUEL_LINE_Y);
+    tft.print("BATT");
+    tft.setCursor(130, FUEL_LINE_Y + 16);
+    tft.print("VOLT");
+
+    // Batt value
+    setValueStyle(tft);
+    tft.setCursor(168, FUEL_LINE_Y + 3);
+    tft.print(battVolts, 3);
 }
 
 // ============================================================================

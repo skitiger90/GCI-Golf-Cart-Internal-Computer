@@ -20,6 +20,11 @@
 
 #define TELEMETRY_MIN_INTERVAL_MS 5000  // Minimum 5 seconds between telemetry packets
 #define HEARTBEAT_MISS_THRESHOLD 4  // Number of missed heartbeats before connection is considered lost
+
+#define FUEL_SAMPLE_COUNT       8       // rolling buffer size (8 × 15s = 2-minute window)
+#define FUEL_MIN_SAMPLES        3       // require at least 3 samples (~45 sec) before first report
+#define FUEL_SAMPLE_INTERVAL_MS 15000   // ms between fuel ADC samples
+#define FUEL_VARIANCE_THRESHOLD 25.0f   // population variance limit (~5% std-dev); tune as needed
 #define STARTUP_GRACE_SECS 30  // Grace period to allow GCD connection before acting on SLEEP_PIN (matches GCD)
 
 #define SLEEP_PIN 35        // LOW = sleep (ignition OFF), HIGH = awake (ignition ON)
@@ -99,6 +104,13 @@ int outdoorLuminosity = -99;
 float airTemperature = -99;
 float battVoltage = -99;
 float fuelLevel = -99;
+
+// Fuel level smoothing state
+float smoothedFuel = -99.0f;              // value transmitted to GCD; -99 = no valid data
+float fuelSampleBuf[FUEL_SAMPLE_COUNT];   // rolling sample buffer
+int   fuelSampleIdx = 0;
+bool  fuelSampleFull = false;
+unsigned long lastFuelSampleTime = 0;
 
 // Previous telemetry values for change detection
 int prevModeHeadLights = -99;
@@ -187,8 +199,26 @@ void setup(void) {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH); // Turn on backlight initially
 
-  // Initialize WiFi to enable MAC address reading
-  WiFi.mode(WIFI_STA);
+  // Initialize WiFi directly via IDF — do NOT call WiFi.mode().
+  // WiFi.mode() calls esp_wifi_init() with WIFI_INIT_CONFIG_DEFAULT, which
+  // requests 4 static rx buffers. This device can only allocate 3, so the
+  // call fails and leaks those 3 partial allocations, leaving insufficient
+  // heap for a subsequent re-init. arduino-esp32 already calls
+  // esp_netif_init() and esp_event_loop_create_default() in initArduino()
+  // before setup() runs, so we can go straight to esp_wifi_init() here.
+  {
+    wifi_init_config_t wCfg = WIFI_INIT_CONFIG_DEFAULT();
+    wCfg.static_rx_buf_num = 3;
+    if (esp_wifi_init(&wCfg) != ESP_OK) {
+      Serial.println("ESP-NOW: WiFi init failed");
+      return;
+    }
+  }
+  esp_wifi_set_mode(WIFI_MODE_STA);
+  if (esp_wifi_start() != ESP_OK) {
+    Serial.println("ESP-NOW: WiFi start failed");
+    return;
+  }
 
   tft.init(); // Initialize the display
   tft.setRotation(DISPLAY_ORIENTATION == 0 ? 1 : 3); // 1 = landscape normal, 3 = landscape flipped
@@ -215,6 +245,27 @@ void setup(void) {
 
   Serial.println("ESP-NOW initialized");
 
+  // Lock the radio onto ESPNOW_CHANNEL. Must be called AFTER esp_now_init()
+  // because WiFi.mode() starts the driver asynchronously — calling
+  // esp_wifi_set_channel() immediately after WiFi.mode() returns
+  // ESP_ERR_WIFI_NOT_INIT. By the time esp_now_init() returns, the driver
+  // is guaranteed started.
+  esp_err_t chErr = ESP_FAIL;
+  for (int i = 0; i < 5; i++) {
+    chErr = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    if (chErr == ESP_OK) break;
+    delay(20);
+  }
+  uint8_t home_ch = 0;
+  wifi_second_chan_t home_sec = WIFI_SECOND_CHAN_NONE;
+  esp_wifi_get_channel(&home_ch, &home_sec);
+  if (chErr != ESP_OK || home_ch != ESPNOW_CHANNEL) {
+    Serial.printf("ESP-NOW: channel set FAILED (err=%d, home=%u, want=%u)\n",
+                  (int)chErr, (unsigned)home_ch, (unsigned)ESPNOW_CHANNEL);
+  } else {
+    Serial.printf("ESP-NOW: home channel = %u\n", (unsigned)home_ch);
+  }
+
   // Open preferences and check for saved peer MAC
   preferences.begin("gci", false);
 
@@ -237,7 +288,9 @@ void setup(void) {
       // Add saved peer
       esp_now_peer_info_t peerInfo = {};
       memcpy(peerInfo.peer_addr, savedMac, 6);
-      peerInfo.channel = ESPNOW_CHANNEL;
+      // channel = 0 means "use whatever the local home channel is" —
+      // sidesteps IDF's "Peer channel != home channel" send-fail check.
+      peerInfo.channel = 0;
       peerInfo.ifidx = WIFI_IF_STA;
       peerInfo.encrypt = false;
 
@@ -502,9 +555,40 @@ void loop() {
     if (percentFuel > 100) percentFuel = 100;
     if (percentFuel < 0) percentFuel = 0;
 
+    // Collect timed fuel sample into rolling buffer for variance-based filtering.
+    // Accepts a reading only when >= FUEL_MIN_SAMPLES have been gathered and variance
+    // is low (stable sensor).  High variance = sloshing or no sensor installed → -99.
+    if (millis() - lastFuelSampleTime >= FUEL_SAMPLE_INTERVAL_MS) {
+      lastFuelSampleTime = millis();
+
+      float sample = (float)percentFuel;
+      fuelSampleBuf[fuelSampleIdx] = sample;
+      fuelSampleIdx = (fuelSampleIdx + 1) % FUEL_SAMPLE_COUNT;
+      if (fuelSampleIdx == 0) fuelSampleFull = true;
+
+      int count = fuelSampleFull ? FUEL_SAMPLE_COUNT : fuelSampleIdx;
+      if (count > 0) {
+        float mean = 0.0f;
+        for (int i = 0; i < count; i++) mean += fuelSampleBuf[i];
+        mean /= count;
+
+        float variance = 0.0f;
+        for (int i = 0; i < count; i++) {
+          float d = fuelSampleBuf[i] - mean;
+          variance += d * d;
+        }
+        variance /= count;
+
+        if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
+          smoothedFuel = mean;
+        else
+          smoothedFuel = -99.0f;  // too few samples, too much variance, or no sensor
+      }
+    }
+
     // Check if telemetry should be sent
     // Send when: data changed, screen turned on, initial connection, or after missed heartbeat when reconnected
-    bool dataChanged = sendData || refreshTelemetry || hasSignificantTelemetryChange(voltsBattADC, tempF_0, (float)percentFuel, modeHeadLights);
+    bool dataChanged = sendData || refreshTelemetry || hasSignificantTelemetryChange(voltsBattADC, tempF_0, smoothedFuel, modeHeadLights);
     bool resendAfterMissedHeartbeat = heartbeatMissed && (consecutiveHeartbeatsMissed == 0);
 
     // Check if minimum interval has elapsed since last send
@@ -515,7 +599,7 @@ void loop() {
       // Update previous values
       prevBattVoltage = voltsBattADC;
       prevAirTemperature = tempF_0;
-      prevFuelLevel = (float)percentFuel;
+      prevFuelLevel = smoothedFuel;
       prevModeHeadLights = modeHeadLights;
 
       // stuff the dataToGcd structure for transmission
@@ -523,7 +607,7 @@ void loop() {
       dataToGcd.outdoorLum = outdoorLuminosity;
       dataToGcd.airTemp = tempF_0;
       dataToGcd.battVolts = voltsBattADC;
-      dataToGcd.fuel = percentFuel;
+      dataToGcd.fuel = smoothedFuel;
 
       sendData = true;
 
@@ -730,7 +814,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         // Add new peer
         esp_now_peer_info_t newPeer = {};  // Initialize all fields to zero
         memcpy(newPeer.peer_addr, newPeerMac, 6);
-        newPeer.channel = ESPNOW_CHANNEL;
+        newPeer.channel = 0;  // 0 = use local home channel (avoids IDF mismatch check)
         newPeer.ifidx = WIFI_IF_STA;  // WiFi Station interface
         newPeer.encrypt = false;
 
@@ -822,7 +906,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
               // Add new peer
               esp_now_peer_info_t newPeer;
               memcpy(newPeer.peer_addr, newPeerMac, 6);
-              newPeer.channel = ESPNOW_CHANNEL;
+              newPeer.channel = 0;  // 0 = use local home channel (avoids IDF mismatch check)
               newPeer.encrypt = false;
 
               if (esp_now_add_peer(&newPeer) == ESP_OK) {
