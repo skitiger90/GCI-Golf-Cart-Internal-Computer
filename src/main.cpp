@@ -103,7 +103,6 @@ int modeHeadLights = -99;
 int outdoorLuminosity = -99;
 float airTemperature = -99;
 float battVoltage = -99;
-float fuelLevel = 100.0f;  // this is set to 100 to prevent false "low fuel" warnings on GCD before we have a valid reading
 
 // Fuel level smoothing state
 float smoothedFuel = 100.0f;              // value transmitted to GCD; defaults to 100 until valid data received
