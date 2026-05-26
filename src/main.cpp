@@ -32,10 +32,19 @@
 #define ONE_WIRE_PIN 13     // DS18B20 temperature sensor and any other One-Wire
 #define ADC_FUEL_PIN 36     // 3.3v max
 #define ADC_BATTERY_PIN 39  // 3.3v max
-#define RELAY_1_PIN 14
-#define RELAY_2_PIN 27
-#define RELAY_3_PIN 26
-#define RELAY_4_PIN 25
+
+// Relay configuration
+#define RELAY1_PIN 25 // used for headlights
+#define RELAY2_PIN 26 // unused
+#define RELAY3_PIN 27 // unused
+#define RELAY4_PIN 14 // unused
+
+// i2c configuration
+#define I2C_SDA_PIN 21
+#define I2C_SCL_PIN 22
+#define I2C_FREQUENCY 100000    // purposely keep at 100kHz to allow longer bus
+#define I2C_ADDR_MCP23008 0x20  // default address with all address pins grounded; can be changed by wiring address pins to VCC
+#define I2C_ADDR_BH1750 0x23    // BH1750 default address (ADDR pin grounded); can be changed to 0x5C by wiring ADDR pin to VCC
 
 #define ESPNOW_CHANNEL 1
 #define ESPNOW_MAX_PAYLOAD 240  // Max payload after wrapper overhead subtracted (ESP-NOW limit: 250 bytes, wrapper: 9 bytes, payload: 241 bytes)
@@ -97,7 +106,7 @@ char pairedMacStr[18] = "";  // Store the paired MAC address string for display 
 int consecutiveHeartbeatsMissed = HEARTBEAT_MISS_THRESHOLD;  // Start disconnected until first heartbeat
 unsigned long lastHeartbeatCheckTime = 0;
 
-// -99 indicates invalid/uninitialized
+// -99 indicates invalid/not installed
 // variables for outbound data
 int modeHeadLights = -99;
 int outdoorLuminosity = -99;
@@ -105,7 +114,7 @@ float airTemperature = -99;
 float battVoltage = -99;
 
 // Fuel level smoothing state
-float smoothedFuel = 100.0f;              // value transmitted to GCD; defaults to 100 until valid data received
+float smoothedFuel = -99;                 // value transmitted to GCD
 float fuelSampleBuf[FUEL_SAMPLE_COUNT];   // rolling sample buffer
 int   fuelSampleIdx = 0;
 bool  fuelSampleFull = false;
