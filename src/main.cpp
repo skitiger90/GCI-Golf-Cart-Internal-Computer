@@ -173,15 +173,15 @@ void setup(void) {
   sensors.begin();
 
   // set relay pinModes
-  pinMode(RELAY_1_PIN, OUTPUT);
-  pinMode(RELAY_2_PIN, OUTPUT);
-  pinMode(RELAY_3_PIN, OUTPUT);
-  pinMode(RELAY_4_PIN, OUTPUT);
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);
+  pinMode(RELAY4_PIN, OUTPUT);
   // set relays to LOW (off)
-  digitalWrite(RELAY_1_PIN, LOW);
-  digitalWrite(RELAY_2_PIN, LOW);
-  digitalWrite(RELAY_3_PIN, LOW);
-  digitalWrite(RELAY_4_PIN, LOW);
+  digitalWrite(RELAY1_PIN, LOW);
+  digitalWrite(RELAY2_PIN, LOW);
+  digitalWrite(RELAY3_PIN, LOW);
+  digitalWrite(RELAY4_PIN, LOW);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(SLEEP_PIN, INPUT);  // External pull-down: LOW = sleep (ignition OFF), HIGH = awake (ignition ON)
@@ -565,7 +565,7 @@ void loop() {
 
     // Collect timed fuel sample into rolling buffer for variance-based filtering.
     // Accepts a reading only when >= FUEL_MIN_SAMPLES have been gathered and variance
-    // is low (stable sensor).  High variance = sloshing or no sensor → hold 100 (no false low warnings).
+    // is low (stable sensor).  High variance or too few samples → keep smoothedFuel unchanged (stays -99 until first valid reading).
     if (millis() - lastFuelSampleTime >= FUEL_SAMPLE_INTERVAL_MS) {
       lastFuelSampleTime = millis();
 
@@ -589,8 +589,7 @@ void loop() {
 
         if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
           smoothedFuel = mean;
-        else
-          smoothedFuel = 100.0f;  // too few samples or too much variance — hold 100 to suppress false low warnings
+        // else: keep current value (stays -99 until first valid reading; holds last accepted reading if temporarily noisy)
       }
     }
 
