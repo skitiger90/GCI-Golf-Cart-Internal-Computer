@@ -25,7 +25,9 @@
 #define FUEL_MIN_SAMPLES        3       // require at least 3 samples (~45 sec) before first report
 #define FUEL_SAMPLE_INTERVAL_MS 15000   // ms between fuel ADC samples
 #define FUEL_VARIANCE_THRESHOLD 25.0f   // population variance limit (~5% std-dev); tune as needed
+#define FUEL_RESET_DELTA_THRESHOLD 25.0f // % jump that flushes the rolling buffer for fast large-change response
 #define STARTUP_GRACE_SECS 30  // Grace period to allow GCD connection before acting on SLEEP_PIN (matches GCD)
+#define DISPLAY_UPDATE_INTERVAL_MS 1000  // Refresh FUEL/BATT display every second regardless of telemetry state
 
 #define SLEEP_PIN 35        // LOW = sleep (ignition OFF), HIGH = awake (ignition ON)
 #define BUTTON_PIN 12       // GPIO34-39 do not have pullups
@@ -338,6 +340,7 @@ void loop() {
   static float voltsFuelADC, voltsBattADC;
   static int percentFuel;
   static bool sendData = false;
+  static unsigned long lastDisplayUpdateTime = 0;
 
   // Check SLEEP_PIN with debounce
   // Requires pin to be stable for SLEEP_PIN_DEBOUNCE_MS before acting
@@ -570,6 +573,10 @@ void loop() {
       lastFuelSampleTime = millis();
 
       float sample = (float)percentFuel;
+      if (smoothedFuel != -99.0f && fabsf(sample - smoothedFuel) > FUEL_RESET_DELTA_THRESHOLD) {
+        fuelSampleIdx = 0;
+        fuelSampleFull = false;
+      }
       fuelSampleBuf[fuelSampleIdx] = sample;
       fuelSampleIdx = (fuelSampleIdx + 1) % FUEL_SAMPLE_COUNT;
       if (fuelSampleIdx == 0) fuelSampleFull = true;
@@ -643,16 +650,17 @@ void loop() {
     }
   }
 
-  // Update display only when new data is available
-  if (sendData) {
-    // Display temperature
+  // Update display on 1-second timer OR immediately on sendData (button press / telemetry sent)
+  bool displayDue = sendData || (screenOn && (millis() - lastDisplayUpdateTime) >= DISPLAY_UPDATE_INTERVAL_MS);
+  if (displayDue) {
     bool sensorConnected = (tempC_0 != DEVICE_DISCONNECTED_C);
     displayTempLine(tft, tempF_0, sensorConnected);
-
-    // Display fuel and battery
     displayFuelBattLine(tft, voltsFuelADC, voltsBattADC);
+    lastDisplayUpdateTime = millis();
+  }
 
-    // Print compressed telemetry format to serial
+  // Serial log only when telemetry was sent
+  if (sendData) {
     char gcdMacStr[18];
     if (hasPeer) {
       sprintf(gcdMacStr, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -662,8 +670,7 @@ void loop() {
     Serial.printf("Telemetry to %s : Lights=%d, Lum=%d, Temp=%.1f, Batt=%.2f, Fuel=%.1f\n",
                   hasPeer ? gcdMacStr : "No Peer",
                   modeHeadLights, outdoorLuminosity, tempF_0, voltsBattADC, (float)percentFuel);
-
-    sendData = false; // Reset flag after display update
+    sendData = false;
   }
 
   delay(100); // Check every 100ms for responsive button
@@ -782,6 +789,9 @@ void createMacAddressStr(char* MacStr){
 // Callback when data is sent
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   if (status != ESP_NOW_SEND_SUCCESS) {
+    // Half-duplex collision: GCD may have been transmitting (e.g. GPS_DATA broadcast)
+    // at the same moment GCI sent this packet; GCD's L2 ACK was not received.
+    // Transient and expected — no retry needed.
     Serial.println("Send Status: Fail");
   }
   if (status ==0){
@@ -946,6 +956,10 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         }
         break;
       }
+
+      case ESPNOW_MSG_GPS_DATA:
+        // GCD broadcasts GPS position to all peers periodically — no action needed on GCI
+        break;
 
       case ESPNOW_MSG_TEXT:
         Serial.print("Text message: ");
