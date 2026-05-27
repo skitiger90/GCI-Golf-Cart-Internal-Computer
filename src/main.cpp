@@ -144,7 +144,7 @@ typedef struct struct_msg_to_gcd {
   int outdoorLum;
   float airTemp;
   float battVolts;
-  float fuel;
+  float fuelPct;
 } structMsgToGcd;
 
 structMsgToGcd dataToGcd;
@@ -614,7 +614,7 @@ void loop() {
       dataToGcd.outdoorLum = outdoorLuminosity;
       dataToGcd.airTemp = tempF_0;
       dataToGcd.battVolts = voltsBattADC;
-      dataToGcd.fuel = smoothedFuel;
+      dataToGcd.fuelPct = smoothedFuel;
 
       sendData = true;
 
