@@ -20,6 +20,7 @@
 #define PAIRED_LINE_Y    28    // "PR xx:xx:xx:xx:xx:xx" or "WAITING FOR PAIRING..."
 #define TEMP_LINE_Y      54    // "TEMP 72.5°F"
 #define FUEL_LINE_Y      80    // "FUEL 1234    BATT 5678"
+#define FUEL_SENSE_LINE_Y 112  // "NO SENSOR" / "ADC GAS" / "GPIO EXPANDER 011"
 
 // ============================================================================
 // COLORS - Named constants instead of hex codes
@@ -52,6 +53,7 @@ void displayMacLine(TFT_eSPI &tft, const char* macAddress);
 void displayPairingLine(TFT_eSPI &tft, PairingStatus status, const char* pairedMac);
 void displayTempLine(TFT_eSPI &tft, float tempF, bool sensorConnected);
 void displayFuelBattLine(TFT_eSPI &tft, float fuelVolts, float battVolts);
+void displayFuelSenseLine(TFT_eSPI &tft, int sensorType, uint8_t gpPins);
 
 // Full screen operations
 void clearScreen(TFT_eSPI &tft);

@@ -82,8 +82,8 @@ void displayTempLine(TFT_eSPI &tft, float tempF, bool sensorConnected) {
 }
 
 void displayFuelBattLine(TFT_eSPI &tft, float fuelVolts, float battVolts) {
-    // Clear the full fuel/batt area (two font-2 lines tall = ~32px)
-    tft.fillRect(0, FUEL_LINE_Y, SCREEN_WIDTH, SCREEN_HEIGHT - FUEL_LINE_Y, TFT_BLACK);
+    // Clear only the fuel/batt area; leave FUEL_SENSE_LINE_Y and below for displayFuelSenseLine
+    tft.fillRect(0, FUEL_LINE_Y, SCREEN_WIDTH, FUEL_SENSE_LINE_Y - FUEL_LINE_Y, TFT_BLACK);
 
     // FUEL label stacked: "FUEL" over "VOLT"
     setLabelStyle(tft);
@@ -108,6 +108,26 @@ void displayFuelBattLine(TFT_eSPI &tft, float fuelVolts, float battVolts) {
     setValueStyle(tft);
     tft.setCursor(168, FUEL_LINE_Y + 3);
     tft.print(battVolts, 3);
+}
+
+void displayFuelSenseLine(TFT_eSPI &tft, int sensorType, uint8_t gpPins) {
+    tft.fillRect(0, FUEL_SENSE_LINE_Y, SCREEN_WIDTH, SCREEN_HEIGHT - FUEL_SENSE_LINE_Y, TFT_BLACK);
+    tft.setCursor(1, FUEL_SENSE_LINE_Y);
+    tft.setTextFont(2);
+    tft.setTextColor(COLOR_LABEL, TFT_BLACK);
+    switch (sensorType) {
+        case 0: tft.print("NO SENSOR");  break;
+        case 1: tft.print("ADC GAS");    break;
+        case 3: tft.print("ADC ELEC");   break;
+        case 2: {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "GPIO EXPANDER %d%d%d",
+                     (gpPins >> 0) & 1, (gpPins >> 1) & 1, (gpPins >> 2) & 1);
+            tft.print(buf);
+            break;
+        }
+        default: tft.print("UNKNOWN"); break;
+    }
 }
 
 // ============================================================================

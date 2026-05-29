@@ -15,7 +15,7 @@
 #include "display.h"
 #include "version.h"
 
-#define SCREEN_TIMEOUT 60 // seconds
+#define SCREEN_TIMEOUT 90 // seconds
 #define PAIRED_MAC_MSG_TIMEOUT 5 // seconds
 #define BUTTON_HOLD_ERASE_SECS 5 // seconds to hold button to erase paired MAC
 
@@ -140,6 +140,7 @@ float battVoltage = -99;
 
 // Fuel sensor type (loaded from NVS, updated via ESPNOW_MSG_CONFIG from GCD)
 int gciFuelSenseType = FUEL_SENSOR_ADC_GAS;
+uint8_t lastMcpPins = 0xFF;  // last raw GPIO register read from MCP23008; displayed on status line
 
 // Fuel level smoothing state
 float smoothedFuel = -99;                 // value transmitted to GCD
@@ -276,6 +277,7 @@ int readMCP23008Fuel() {
   failStreak = 0;
 
   uint8_t pins = Wire.read();
+  lastMcpPins = pins;
   bool gp0 = (pins >> 0) & 1;
   bool gp1 = (pins >> 1) & 1;
   bool gp2 = (pins >> 2) & 1;
@@ -848,6 +850,7 @@ void loop() {
     bool sensorConnected = (tempC_0 != DEVICE_DISCONNECTED_C);
     displayTempLine(tft, tempF_0, sensorConnected);
     displayFuelBattLine(tft, voltsFuelADC, voltsBattADC);
+    displayFuelSenseLine(tft, gciFuelSenseType, lastMcpPins);
     lastDisplayUpdateTime = millis();
   }
 
