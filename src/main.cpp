@@ -252,7 +252,7 @@ void mcpRuntimeRecover() {
 }
 
 // Returns mapped SOC % (25/50/75/100) or -99 on I2C failure or invalid pin state.
-// GP0=bit0 (25% sensor), GP1=bit1 (50% sensor), GP2=bit2 (75% sensor). Logic 1 = dry/below that level.
+// GP0=bit0 (25% sensor), GP1=bit1 (50% sensor), GP2=bit2 (75% sensor). Logic 1 = liquid present/at or above that level.
 // Holds last valid reading for up to 5 consecutive I2C failures before reporting -99.
 // Holds last valid reading for up to 2 consecutive invalid pin states (transition debounce).
 int readMCP23008Fuel() {
@@ -295,10 +295,10 @@ int readMCP23008Fuel() {
   lastPins = pins;
 
   int result = -99;
-  if (!gp0 && !gp1 && !gp2) result = 100;
-  else if (!gp0 && !gp1 &&  gp2) result = 75;
-  else if (!gp0 &&  gp1 &&  gp2) result = 50;
-  else if ( gp0 &&  gp1 &&  gp2) result = 25;
+  if ( gp0 &&  gp1 &&  gp2) result = 100;
+  else if ( gp0 &&  gp1 && !gp2) result = 75;
+  else if ( gp0 && !gp1 && !gp2) result = 50;
+  else if (!gp0 && !gp1 && !gp2) result = 25;
 
   if (result == -99) {
     invalidStreak++;
