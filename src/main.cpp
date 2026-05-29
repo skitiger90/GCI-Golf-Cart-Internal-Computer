@@ -26,6 +26,11 @@
 #define FUEL_SAMPLE_INTERVAL_MS 15000   // ms between fuel ADC samples
 #define FUEL_VARIANCE_THRESHOLD 25.0f   // population variance limit (~5% std-dev); tune as needed
 #define FUEL_RESET_DELTA_THRESHOLD 25.0f // % jump that flushes the rolling buffer for fast large-change response
+
+// LiFePO4 16S pack voltage breakpoints (fixed by cell chemistry — 2.5/3.25/3.3325V per cell × 16)
+#define ELEC_EMPTY_V  40.0f   // 0%   — 2.5V/cell × 16
+#define ELEC_KNEE_V   52.0f   // 25%  — 3.25V/cell × 16, plateau start
+#define ELEC_FULL_V   53.32f  // 100% — 3.3325V/cell × 16, resting full; above this clamps to 100% (covers charging 58–60V)
 #define STARTUP_GRACE_SECS 30  // Grace period to allow GCD connection before acting on SLEEP_PIN (matches GCD)
 #define DISPLAY_UPDATE_INTERVAL_MS 1000  // Refresh FUEL/BATT display every second regardless of telemetry state
 
@@ -294,8 +299,8 @@ void setup(void) {
   // Open preferences and check for saved peer MAC
   preferences.begin("gci", false);
 
-  // Load fuel sensor type (default ADC_GAS for backward compatibility)
-  gciFuelSenseType = preferences.getInt("fuel_sense_type", FUEL_SENSOR_ADC_GAS);
+  // Load fuel sensor type; default NONE — GCD sends the configured type on connect
+  gciFuelSenseType = preferences.getInt("fuel_sense_type", FUEL_SENSOR_NONE);
   Serial.printf("Fuel sense type: %d\n", gciFuelSenseType);
 
   // Try to load saved peer MAC address
@@ -577,46 +582,86 @@ void loop() {
     voltsFuelADC = (rawFuelADC / 4095.0) * 3.3;
     voltsBattADC = (rawBattADC / 4095.0) * 3.3;
 
-    // Calculate fuel percentage from voltage
-    float fuelCalc = (-90.21 * voltsFuelADC) + 105.55;
-    percentFuel = (int)fuelCalc;
+    // Select fuel sensing algorithm based on configured sensor type
+    switch (gciFuelSenseType) {
 
-    // Limit percentFuel to 0-100 range
-    if (percentFuel > 100) percentFuel = 100;
-    if (percentFuel < 0) percentFuel = 0;
+      case FUEL_SENSOR_NONE:
+        smoothedFuel = -99.0f;
+        break;
 
-    // Collect timed fuel sample into rolling buffer for variance-based filtering.
-    // Accepts a reading only when >= FUEL_MIN_SAMPLES have been gathered and variance
-    // is low (stable sensor).  High variance or too few samples → keep smoothedFuel unchanged (stays -99 until first valid reading).
-    if (millis() - lastFuelSampleTime >= FUEL_SAMPLE_INTERVAL_MS) {
-      lastFuelSampleTime = millis();
+      case FUEL_SENSOR_ADC_GAS: {
+        float fuelCalc = (-90.21f * voltsFuelADC) + 105.55f;
+        percentFuel = (int)fuelCalc;
+        if (percentFuel > 100) percentFuel = 100;
+        if (percentFuel < 0)   percentFuel = 0;
 
-      float sample = (float)percentFuel;
-      if (fuelSampleFull && smoothedFuel != -99.0f && fabsf(sample - smoothedFuel) > FUEL_RESET_DELTA_THRESHOLD) {
-        fuelSampleIdx = 0;
-        fuelSampleFull = false;
-      }
-      fuelSampleBuf[fuelSampleIdx] = sample;
-      fuelSampleIdx = (fuelSampleIdx + 1) % FUEL_SAMPLE_COUNT;
-      if (fuelSampleIdx == 0) fuelSampleFull = true;
-
-      int count = fuelSampleFull ? FUEL_SAMPLE_COUNT : fuelSampleIdx;
-      if (count > 0) {
-        float mean = 0.0f;
-        for (int i = 0; i < count; i++) mean += fuelSampleBuf[i];
-        mean /= count;
-
-        float variance = 0.0f;
-        for (int i = 0; i < count; i++) {
-          float d = fuelSampleBuf[i] - mean;
-          variance += d * d;
+        if (millis() - lastFuelSampleTime >= FUEL_SAMPLE_INTERVAL_MS) {
+          lastFuelSampleTime = millis();
+          float sample = (float)percentFuel;
+          if (fuelSampleFull && smoothedFuel != -99.0f && fabsf(sample - smoothedFuel) > FUEL_RESET_DELTA_THRESHOLD) {
+            fuelSampleIdx = 0;
+            fuelSampleFull = false;
+          }
+          fuelSampleBuf[fuelSampleIdx] = sample;
+          fuelSampleIdx = (fuelSampleIdx + 1) % FUEL_SAMPLE_COUNT;
+          if (fuelSampleIdx == 0) fuelSampleFull = true;
+          int count = fuelSampleFull ? FUEL_SAMPLE_COUNT : fuelSampleIdx;
+          if (count > 0) {
+            float mean = 0.0f;
+            for (int i = 0; i < count; i++) mean += fuelSampleBuf[i];
+            mean /= count;
+            float variance = 0.0f;
+            for (int i = 0; i < count; i++) { float d = fuelSampleBuf[i] - mean; variance += d * d; }
+            variance /= count;
+            if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
+              smoothedFuel = mean;
+          }
         }
-        variance /= count;
-
-        if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
-          smoothedFuel = mean;
-        // else: keep current value (stays -99 until first valid reading; holds last accepted reading if temporarily noisy)
+        break;
       }
+
+      case FUEL_SENSOR_ADC_ELEC: {
+        // Two-zone piecewise formula for LiFePO4 16S pack via voltage divider (R1=1MΩ, R2=56KΩ)
+        float actualBattV = voltsBattADC * (1056000.0f / 56000.0f);
+        float pct;
+        if      (actualBattV <= ELEC_EMPTY_V) pct = 0.0f;
+        else if (actualBattV <  ELEC_KNEE_V)  pct = (actualBattV - ELEC_EMPTY_V) / (ELEC_KNEE_V - ELEC_EMPTY_V) * 25.0f;
+        else if (actualBattV <  ELEC_FULL_V)  pct = 25.0f + (actualBattV - ELEC_KNEE_V) / (ELEC_FULL_V - ELEC_KNEE_V) * 75.0f;
+        else                                   pct = 100.0f;
+
+        if (millis() - lastFuelSampleTime >= FUEL_SAMPLE_INTERVAL_MS) {
+          lastFuelSampleTime = millis();
+          float sample = pct;
+          if (fuelSampleFull && smoothedFuel != -99.0f && fabsf(sample - smoothedFuel) > FUEL_RESET_DELTA_THRESHOLD) {
+            fuelSampleIdx = 0;
+            fuelSampleFull = false;
+          }
+          fuelSampleBuf[fuelSampleIdx] = sample;
+          fuelSampleIdx = (fuelSampleIdx + 1) % FUEL_SAMPLE_COUNT;
+          if (fuelSampleIdx == 0) fuelSampleFull = true;
+          int count = fuelSampleFull ? FUEL_SAMPLE_COUNT : fuelSampleIdx;
+          if (count > 0) {
+            float mean = 0.0f;
+            for (int i = 0; i < count; i++) mean += fuelSampleBuf[i];
+            mean /= count;
+            float variance = 0.0f;
+            for (int i = 0; i < count; i++) { float d = fuelSampleBuf[i] - mean; variance += d * d; }
+            variance /= count;
+            if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
+              smoothedFuel = mean;
+          }
+          Serial.printf("ADC_ELEC: battV=%.2fV pct=%.1f%% smoothed=%.1f%%\n", actualBattV, pct, smoothedFuel);
+        }
+        break;
+      }
+
+      case FUEL_SENSOR_GPIO_EXP:
+        smoothedFuel = -99.0f;  // Phase 3
+        break;
+
+      default:
+        smoothedFuel = -99.0f;
+        break;
     }
 
     // Check if telemetry should be sent
