@@ -27,6 +27,7 @@
 #define FUEL_SAMPLE_INTERVAL_MS 15000   // ms between fuel ADC samples
 #define FUEL_VARIANCE_THRESHOLD 25.0f   // population variance limit (~5% std-dev); tune as needed
 #define FUEL_RESET_DELTA_THRESHOLD 25.0f // % jump that flushes the rolling buffer for fast large-change response
+#define GPIO_EXP_CONFIRM_COUNT  5       // consecutive matching reads required before committing a new GPIO EXPANDER level (~500ms at 100ms loop)
 
 // LiFePO4 16S pack voltage breakpoints (fixed by cell chemistry — 2.5/3.25/3.3325V per cell × 16)
 #define ELEC_EMPTY_V  40.0f   // 0%   — 2.5V/cell × 16
@@ -784,8 +785,24 @@ void loop() {
       }
 
       case FUEL_SENSOR_GPIO_EXP: {
+        static int     pendingGpioFuel  = -99;
+        static uint8_t gpioConfirmCount = 0;
         int gpioFuel = readMCP23008Fuel();
-        smoothedFuel = (float)gpioFuel;
+        if (gpioFuel == -99) {
+          smoothedFuel    = -99.0f;
+          pendingGpioFuel = -99;
+          gpioConfirmCount = 0;
+        } else if (gpioFuel == pendingGpioFuel) {
+          if (++gpioConfirmCount >= GPIO_EXP_CONFIRM_COUNT) {
+            if ((float)gpioFuel != smoothedFuel)
+              Serial.printf("GPIO_EXP: confirmed fuel=%d%% (was %.0f%%)\n", gpioFuel, smoothedFuel);
+            smoothedFuel    = (float)gpioFuel;
+            gpioConfirmCount = GPIO_EXP_CONFIRM_COUNT; // cap to prevent overflow on long stable reads
+          }
+        } else {
+          pendingGpioFuel  = gpioFuel;
+          gpioConfirmCount = 1;
+        }
         break;
       }
 
