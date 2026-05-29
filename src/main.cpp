@@ -53,6 +53,12 @@
 
 #define DISPLAY_ORIENTATION 0       // 0 = Normal, 1 = Flipped (180 degrees)
 
+// Fuel sensor type constants (must match GCD src/config.h)
+#define FUEL_SENSOR_NONE     0
+#define FUEL_SENSOR_ADC_GAS  1
+#define FUEL_SENSOR_GPIO_EXP 2
+#define FUEL_SENSOR_ADC_ELEC 3
+
 // ESP-NOW message types (must match GCD)
 typedef enum {
     ESPNOW_MSG_TEXT = 0,
@@ -62,8 +68,14 @@ typedef enum {
     ESPNOW_MSG_ACK = 4,
     ESPNOW_MSG_HEARTBEAT = 5,
     ESPNOW_MSG_IS_HOME = 6,
-    ESPNOW_MSG_IS_DAYTIME = 7
+    ESPNOW_MSG_IS_DAYTIME = 7,
+    ESPNOW_MSG_CONFIG = 8  // GCD → GCI configuration (must match GCD)
 } espnow_msg_type_t;
+
+// Config message payload (must match GCD)
+typedef struct __attribute__((packed)) {
+    int32_t fuelSensorType;
+} structMsgConfig;
 
 // ESP-NOW message structure (must match GCD)
 typedef struct __attribute__((packed)) {
@@ -114,6 +126,9 @@ int modeHeadLights = -99;
 int outdoorLuminosity = -99;
 float airTemperature = -99;
 float battVoltage = -99;
+
+// Fuel sensor type (loaded from NVS, updated via ESPNOW_MSG_CONFIG from GCD)
+int gciFuelSenseType = FUEL_SENSOR_ADC_GAS;
 
 // Fuel level smoothing state
 float smoothedFuel = -99;                 // value transmitted to GCD
@@ -278,6 +293,10 @@ void setup(void) {
 
   // Open preferences and check for saved peer MAC
   preferences.begin("gci", false);
+
+  // Load fuel sensor type (default ADC_GAS for backward compatibility)
+  gciFuelSenseType = preferences.getInt("fuel_sense_type", FUEL_SENSOR_ADC_GAS);
+  Serial.printf("Fuel sense type: %d\n", gciFuelSenseType);
 
   // Try to load saved peer MAC address
   uint8_t savedMac[6] = {0};
@@ -888,9 +907,10 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     Serial.printf("Received %s from %s\n",
-                  msg->type == ESPNOW_MSG_COMMAND ? "COMMAND" :
-                  msg->type == ESPNOW_MSG_TEXT ? "TEXT" :
-                  msg->type == ESPNOW_MSG_HEARTBEAT ? "HEARTBEAT" : "MESSAGE",
+                  msg->type == ESPNOW_MSG_COMMAND   ? "COMMAND" :
+                  msg->type == ESPNOW_MSG_TEXT       ? "TEXT" :
+                  msg->type == ESPNOW_MSG_HEARTBEAT  ? "HEARTBEAT" :
+                  msg->type == ESPNOW_MSG_CONFIG     ? "CONFIG" : "MESSAGE",
                   mac_str);
 
     // Route by message type
@@ -994,6 +1014,16 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         if (msg->data_len >= 1) {
           is_daylight = (msg->data[0] != 0);
           Serial.printf("Received is_daylight status: %s\n", is_daylight ? "DAYTIME" : "NIGHTTIME");
+        }
+        break;
+
+      case ESPNOW_MSG_CONFIG:
+        if (msg->data_len >= (int)sizeof(structMsgConfig)) {
+          structMsgConfig cfg;
+          memcpy(&cfg, msg->data, sizeof(cfg));
+          gciFuelSenseType = cfg.fuelSensorType;
+          preferences.putInt("fuel_sense_type", gciFuelSenseType);
+          Serial.printf("Received fuel_sense_type=%d, saved to NVS\n", gciFuelSenseType);
         }
         break;
 
