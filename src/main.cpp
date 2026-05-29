@@ -573,7 +573,7 @@ void loop() {
       lastFuelSampleTime = millis();
 
       float sample = (float)percentFuel;
-      if (smoothedFuel != -99.0f && fabsf(sample - smoothedFuel) > FUEL_RESET_DELTA_THRESHOLD) {
+      if (fuelSampleFull && smoothedFuel != -99.0f && fabsf(sample - smoothedFuel) > FUEL_RESET_DELTA_THRESHOLD) {
         fuelSampleIdx = 0;
         fuelSampleFull = false;
       }
