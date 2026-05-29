@@ -50,6 +50,8 @@
 #define RELAY3_PIN 27 // unused
 #define RELAY4_PIN 14 // unused
 
+#define DEBUG_MCP23008 0  // 1 = log every pin read; 0 = log GP changes only
+
 // i2c configuration
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
@@ -191,34 +193,118 @@ esp_now_peer_info_t peerInfo;
 String tx_success;   // Variable to store if sending data was successful
 
 
+// Bit-bang 9 SCL pulses + STOP before Wire.begin() to release any I2C slave
+// stuck mid-transaction from a prior ESP32 reset or deep-sleep wake.
+// Safe to call unconditionally — harmless when the bus is already clean.
+void i2cBusRecover() {
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  bool sdaStuck = false;
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(I2C_SCL_PIN, HIGH); delayMicroseconds(5);
+    if (digitalRead(I2C_SDA_PIN) == LOW) sdaStuck = true;
+    digitalWrite(I2C_SCL_PIN, LOW);  delayMicroseconds(5);
+  }
+  // STOP condition: SDA rises while SCL is HIGH
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);  delayMicroseconds(5);
+  digitalWrite(I2C_SCL_PIN, HIGH); delayMicroseconds(5);
+  digitalWrite(I2C_SDA_PIN, HIGH); delayMicroseconds(5);
+  pinMode(I2C_SDA_PIN, INPUT);
+  pinMode(I2C_SCL_PIN, INPUT);
+  if (sdaStuck) Serial.println("I2C: SDA was stuck — bus recovery applied");
+  else          Serial.println("I2C: bus clean");
+}
+
 void initMCP23008() {
+  // Set all pins as inputs
   Wire.beginTransmission(I2C_ADDR_MCP23008);
   Wire.write(0x00);  // IODIR register
-  Wire.write(0xFF);  // all pins as inputs
+  Wire.write(0xFF);  // all inputs
   uint8_t err = Wire.endTransmission();
-  if (err != 0)
-    Serial.printf("MCP23008 init failed (I2C err=%d)\n", err);
-  else
-    Serial.println("MCP23008 initialized");
+  if (err != 0) { Serial.printf("MCP23008 IODIR write failed (I2C err=%d)\n", err); return; }
+
+  // Enable internal pull-ups on all pins so undriven pins read 1 (dry/fault), not 0
+  Wire.beginTransmission(I2C_ADDR_MCP23008);
+  Wire.write(0x06);  // GPPU register
+  Wire.write(0xFF);  // pull-ups on all pins
+  err = Wire.endTransmission();
+  if (err != 0) { Serial.printf("MCP23008 GPPU write failed (I2C err=%d)\n", err); return; }
+
+  // Read back IODIR to confirm writes are landing
+  Wire.beginTransmission(I2C_ADDR_MCP23008);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+  Wire.requestFrom((uint8_t)I2C_ADDR_MCP23008, (uint8_t)1);
+  uint8_t iodir = Wire.available() ? Wire.read() : 0xFF;
+  Serial.printf("MCP23008 initialized (IODIR readback=0x%02X)\n", iodir);
+}
+
+// Full runtime recovery: release Wire, bit-bang bus clear, restart Wire, re-init chip.
+// Wire.end() is required before bit-banging so the I2C peripheral releases SDA/SCL.
+void mcpRuntimeRecover() {
+  Serial.println("MCP23008: runtime bus recovery");
+  Wire.end();
+  i2cBusRecover();
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQUENCY);
+  initMCP23008();
 }
 
 // Returns mapped SOC % (25/50/75/100) or -99 on I2C failure or invalid pin state.
-// GP0=bit0 (25% sensor), GP1=bit1 (50% sensor), GP3=bit3 (75% sensor). Logic 1 = dry/below that level.
+// GP0=bit0 (25% sensor), GP1=bit1 (50% sensor), GP2=bit2 (75% sensor). Logic 1 = dry/below that level.
+// Holds last valid reading for up to 5 consecutive I2C failures before reporting -99.
+// Holds last valid reading for up to 2 consecutive invalid pin states (transition debounce).
 int readMCP23008Fuel() {
+  static int     lastValid     = -99;
+  static uint8_t failStreak    = 0;
+  static uint8_t invalidStreak = 0;
+  static uint8_t lastPins      = 0xFF;
+
   Wire.beginTransmission(I2C_ADDR_MCP23008);
   Wire.write(0x09);  // GPIO register
-  if (Wire.endTransmission(false) != 0) return -99;
-  if (Wire.requestFrom((uint8_t)I2C_ADDR_MCP23008, (uint8_t)1) != 1) return -99;
+  bool txFail = Wire.endTransmission(true) != 0;
+  bool rxFail = !txFail && (Wire.requestFrom((uint8_t)I2C_ADDR_MCP23008, (uint8_t)1) != 1);
+
+  if (txFail || rxFail) {
+    failStreak++;
+    invalidStreak = 0;
+    Serial.printf("MCP23008: I2C %s fail (streak=%d)\n", txFail ? "tx" : "rx", failStreak);
+    if (failStreak == 3 || (failStreak > 3 && (failStreak - 3) % 30 == 0))
+      mcpRuntimeRecover();  // full Wire.end+recover+Wire.begin+init; retries every 30 failures
+    return (failStreak >= 6) ? -99 : lastValid;  // hold for up to 5 failures before reporting -99
+  }
+  failStreak = 0;
+
   uint8_t pins = Wire.read();
   bool gp0 = (pins >> 0) & 1;
   bool gp1 = (pins >> 1) & 1;
-  bool gp3 = (pins >> 3) & 1;
-  Serial.printf("MCP23008: pins=0x%02X GP0=%d GP1=%d GP3=%d\n", pins, gp0, gp1, gp3);
-  if (!gp0 && !gp1 && !gp3) return 100;
-  if (!gp0 && !gp1 &&  gp3) return 75;
-  if (!gp0 &&  gp1 &&  gp3) return 50;
-  if ( gp0 &&  gp1 &&  gp3) return 25;
-  return -99;
+  bool gp2 = (pins >> 2) & 1;
+
+#if DEBUG_MCP23008
+  Serial.printf("MCP23008: pins=0x%02X [%d%d%d%d%d%d%d%d] GP0=%d GP1=%d GP2=%d\n",
+                pins,
+                (pins>>7)&1, (pins>>6)&1, (pins>>5)&1, (pins>>4)&1,
+                (pins>>3)&1, (pins>>2)&1, (pins>>1)&1, (pins>>0)&1,
+                gp0, gp1, gp2);
+#else
+  if (pins != lastPins)
+    Serial.printf("MCP23008: GP0=%d GP1=%d GP2=%d (0x%02X)\n", gp0, gp1, gp2, pins);
+#endif
+  lastPins = pins;
+
+  int result = -99;
+  if (!gp0 && !gp1 && !gp2) result = 100;
+  else if (!gp0 && !gp1 &&  gp2) result = 75;
+  else if (!gp0 &&  gp1 &&  gp2) result = 50;
+  else if ( gp0 &&  gp1 &&  gp2) result = 25;
+
+  if (result == -99) {
+    invalidStreak++;
+    return (invalidStreak >= 3) ? -99 : lastValid;  // hold for up to 2 invalid reads
+  }
+  invalidStreak = 0;
+  lastValid = result;
+  return result;
 }
 
 
@@ -339,7 +425,20 @@ void setup(void) {
   gciFuelSenseType = preferences.getInt("fuel_sense_type", FUEL_SENSOR_NONE);
   Serial.printf("Fuel sense type: %d\n", gciFuelSenseType);
 
+  i2cBusRecover();
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQUENCY);
+  {
+    Serial.print("I2C scan: ");
+    bool found = false;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0) {
+        Serial.printf("0x%02X ", addr);
+        found = true;
+      }
+    }
+    Serial.println(found ? "" : "no devices found");
+  }
   if (gciFuelSenseType == FUEL_SENSOR_GPIO_EXP)
     initMCP23008();
 
@@ -861,6 +960,8 @@ void enterDeepSleep() {
   delay(100);
 
   // Enter deep sleep (will wake and reboot when SLEEP_PIN goes HIGH)
+  Serial.println("GCI entering deep sleep");
+  Serial.flush();
   esp_deep_sleep_start();
 }
 
