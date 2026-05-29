@@ -733,7 +733,7 @@ void loop() {
     }
     Serial.printf("Telemetry to %s : Lights=%d, Lum=%d, Temp=%.1f, Batt=%.2f, Fuel=%.1f\n",
                   hasPeer ? gcdMacStr : "No Peer",
-                  modeHeadLights, outdoorLuminosity, tempF_0, voltsBattADC, (float)percentFuel);
+                  modeHeadLights, outdoorLuminosity, tempF_0, voltsBattADC, smoothedFuel);
     sendData = false;
   }
 
