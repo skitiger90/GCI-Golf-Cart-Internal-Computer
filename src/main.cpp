@@ -30,7 +30,10 @@
 // LiFePO4 16S pack voltage breakpoints (fixed by cell chemistry — 2.5/3.25/3.3325V per cell × 16)
 #define ELEC_EMPTY_V  40.0f   // 0%   — 2.5V/cell × 16
 #define ELEC_KNEE_V   52.0f   // 25%  — 3.25V/cell × 16, plateau start
-#define ELEC_FULL_V   53.32f  // 100% — 3.3325V/cell × 16, resting full; above this clamps to 100% (covers charging 58–60V)
+#define ELEC_FULL_V              53.32f  // 100% — 3.3325V/cell × 16, resting full; above this clamps to 100% (covers charging 58–60V)
+#define ELEC_SAMPLE_INTERVAL_MS  2000    // 2s EMA tick
+#define ELEC_EMA_ALPHA           0.1f    // τ ≈ 10 samples (~20s); plateau maps 1mV→~0.057% SOC, low α needed
+#define ELEC_DEADBAND            3.0f    // min EMA deviation to update reported smoothedFuel; suppresses plateau ADC noise
 #define STARTUP_GRACE_SECS 30  // Grace period to allow GCD connection before acting on SLEEP_PIN (matches GCD)
 #define DISPLAY_UPDATE_INTERVAL_MS 1000  // Refresh FUEL/BATT display every second regardless of telemetry state
 
@@ -141,6 +144,7 @@ float fuelSampleBuf[FUEL_SAMPLE_COUNT];   // rolling sample buffer
 int   fuelSampleIdx = 0;
 bool  fuelSampleFull = false;
 unsigned long lastFuelSampleTime = 0;
+float elecEma = -1.0f;  // internal EMA state for ADC_ELEC; separate from smoothedFuel to allow dead-band gating
 
 // Previous telemetry values for change detection
 int prevModeHeadLights = -99;
@@ -621,36 +625,23 @@ void loop() {
       }
 
       case FUEL_SENSOR_ADC_ELEC: {
-        // Two-zone piecewise formula for LiFePO4 16S pack via voltage divider (R1=1MΩ, R2=56KΩ)
         float actualBattV = voltsBattADC * (1056000.0f / 56000.0f);
         float pct;
         if      (actualBattV <= ELEC_EMPTY_V) pct = 0.0f;
         else if (actualBattV <  ELEC_KNEE_V)  pct = (actualBattV - ELEC_EMPTY_V) / (ELEC_KNEE_V - ELEC_EMPTY_V) * 25.0f;
         else if (actualBattV <  ELEC_FULL_V)  pct = 25.0f + (actualBattV - ELEC_KNEE_V) / (ELEC_FULL_V - ELEC_KNEE_V) * 75.0f;
         else                                   pct = 100.0f;
-
-        if (millis() - lastFuelSampleTime >= FUEL_SAMPLE_INTERVAL_MS) {
+        if (millis() - lastFuelSampleTime >= ELEC_SAMPLE_INTERVAL_MS) {
           lastFuelSampleTime = millis();
-          float sample = pct;
-          if (fuelSampleFull && smoothedFuel != -99.0f && fabsf(sample - smoothedFuel) > FUEL_RESET_DELTA_THRESHOLD) {
-            fuelSampleIdx = 0;
-            fuelSampleFull = false;
+          if (elecEma < 0.0f) {
+            elecEma = pct;
+            smoothedFuel = pct;
+          } else {
+            elecEma = elecEma * (1.0f - ELEC_EMA_ALPHA) + pct * ELEC_EMA_ALPHA;
+            if (fabsf(elecEma - smoothedFuel) >= ELEC_DEADBAND)
+              smoothedFuel = elecEma;
           }
-          fuelSampleBuf[fuelSampleIdx] = sample;
-          fuelSampleIdx = (fuelSampleIdx + 1) % FUEL_SAMPLE_COUNT;
-          if (fuelSampleIdx == 0) fuelSampleFull = true;
-          int count = fuelSampleFull ? FUEL_SAMPLE_COUNT : fuelSampleIdx;
-          if (count > 0) {
-            float mean = 0.0f;
-            for (int i = 0; i < count; i++) mean += fuelSampleBuf[i];
-            mean /= count;
-            float variance = 0.0f;
-            for (int i = 0; i < count; i++) { float d = fuelSampleBuf[i] - mean; variance += d * d; }
-            variance /= count;
-            if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
-              smoothedFuel = mean;
-          }
-          Serial.printf("ADC_ELEC: battV=%.2fV pct=%.1f%% smoothed=%.1f%%\n", actualBattV, pct, smoothedFuel);
+          Serial.printf("ADC_ELEC: battV=%.2fV pct=%.1f%% ema=%.1f%% reported=%.1f%%\n", actualBattV, pct, elecEma, smoothedFuel);
         }
         break;
       }
