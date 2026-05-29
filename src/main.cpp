@@ -9,6 +9,7 @@
 #include <DallasTemperature.h>
 #include <Preferences.h>
 #include <esp_sleep.h>
+#include <Wire.h>
 
 #include "prototypes.h"
 #include "display.h"
@@ -190,6 +191,37 @@ esp_now_peer_info_t peerInfo;
 String tx_success;   // Variable to store if sending data was successful
 
 
+void initMCP23008() {
+  Wire.beginTransmission(I2C_ADDR_MCP23008);
+  Wire.write(0x00);  // IODIR register
+  Wire.write(0xFF);  // all pins as inputs
+  uint8_t err = Wire.endTransmission();
+  if (err != 0)
+    Serial.printf("MCP23008 init failed (I2C err=%d)\n", err);
+  else
+    Serial.println("MCP23008 initialized");
+}
+
+// Returns mapped SOC % (25/50/75/100) or -99 on I2C failure or invalid pin state.
+// GP0=bit0 (25% sensor), GP1=bit1 (50% sensor), GP3=bit3 (75% sensor). Logic 1 = dry/below that level.
+int readMCP23008Fuel() {
+  Wire.beginTransmission(I2C_ADDR_MCP23008);
+  Wire.write(0x09);  // GPIO register
+  if (Wire.endTransmission(false) != 0) return -99;
+  if (Wire.requestFrom((uint8_t)I2C_ADDR_MCP23008, (uint8_t)1) != 1) return -99;
+  uint8_t pins = Wire.read();
+  bool gp0 = (pins >> 0) & 1;
+  bool gp1 = (pins >> 1) & 1;
+  bool gp3 = (pins >> 3) & 1;
+  Serial.printf("MCP23008: pins=0x%02X GP0=%d GP1=%d GP3=%d\n", pins, gp0, gp1, gp3);
+  if (!gp0 && !gp1 && !gp3) return 100;
+  if (!gp0 && !gp1 &&  gp3) return 75;
+  if (!gp0 &&  gp1 &&  gp3) return 50;
+  if ( gp0 &&  gp1 &&  gp3) return 25;
+  return -99;
+}
+
+
 /**************
  *    SETUP   *
  **************/
@@ -306,6 +338,10 @@ void setup(void) {
   // Load fuel sensor type; default NONE — GCD sends the configured type on connect
   gciFuelSenseType = preferences.getInt("fuel_sense_type", FUEL_SENSOR_NONE);
   Serial.printf("Fuel sense type: %d\n", gciFuelSenseType);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQUENCY);
+  if (gciFuelSenseType == FUEL_SENSOR_GPIO_EXP)
+    initMCP23008();
 
   // Try to load saved peer MAC address
   uint8_t savedMac[6] = {0};
@@ -646,9 +682,11 @@ void loop() {
         break;
       }
 
-      case FUEL_SENSOR_GPIO_EXP:
-        smoothedFuel = -99.0f;  // Phase 3
+      case FUEL_SENSOR_GPIO_EXP: {
+        int gpioFuel = readMCP23008Fuel();
+        smoothedFuel = (float)gpioFuel;
         break;
+      }
 
       default:
         smoothedFuel = -99.0f;
@@ -1060,6 +1098,8 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
           gciFuelSenseType = cfg.fuelSensorType;
           preferences.putInt("fuel_sense_type", gciFuelSenseType);
           Serial.printf("Received fuel_sense_type=%d, saved to NVS\n", gciFuelSenseType);
+          if (gciFuelSenseType == FUEL_SENSOR_GPIO_EXP)
+            initMCP23008();
         }
         break;
 
