@@ -171,6 +171,7 @@ int   luxLightsOn       = 200;     // lux threshold to turn headlights ON  (load
 int   luxLightsOff      = 400;     // lux threshold to turn headlights OFF (loaded from NVS)
 int   lastLuxSent       = -999;    // last outdoorLux value transmitted; for change-detection
 unsigned long lastLuxSampleTime = 0;
+volatile bool luxThresholdChanged = false;  // set by ESP-NOW callback to force immediate relay re-evaluation
 
 // Golf cart command codes (must match GCD)
 typedef enum {
@@ -855,15 +856,31 @@ void loop() {
         break;
     }
 
+    // Re-evaluate headlight relay immediately when thresholds change (no waiting for 1-second timer)
+    if (luxThresholdChanged && bhSensorPresent && luxEma > 0.0f) {
+      luxThresholdChanged = false;
+      if (luxEma < (float)luxLightsOn && !headlightsOn) {
+        headlightsOn = true;
+        digitalWrite(RELAY1_PIN, HIGH);
+        modeHeadLights = 1;
+        Serial.printf("Headlights ON after threshold update (lux=%.0f < %d)\n", luxEma, luxLightsOn);
+      } else if (luxEma >= (float)luxLightsOff && headlightsOn) {
+        headlightsOn = false;
+        digitalWrite(RELAY1_PIN, LOW);
+        modeHeadLights = 0;
+        Serial.printf("Headlights OFF after threshold update (lux=%.0f >= %d)\n", luxEma, luxLightsOff);
+      }
+    }
+
     // Sample BH1750 and control headlight relay every 1 s
     if (millis() - lastLuxSampleTime >= 1000) {
       lastLuxSampleTime = millis();
       if (bhSensorPresent) {
         float raw = readBH1750Lux();
-        if (raw >= 0.0f)
+        if (raw > 0.0f)
           luxEma = (luxEma < 0.0f) ? raw : (0.3f * raw + 0.7f * luxEma);
         // Hysteresis: turn ON below luxLightsOn, turn OFF above luxLightsOff
-        if (luxEma >= 0.0f && luxEma < (float)luxLightsOn && !headlightsOn) {
+        if (luxEma > 0.0f && luxEma < (float)luxLightsOn && !headlightsOn) {
           headlightsOn = true;
           digitalWrite(RELAY1_PIN, HIGH);
           Serial.printf("Headlights ON (lux=%.0f < %d)\n", luxEma, luxLightsOn);
@@ -884,7 +901,7 @@ void loop() {
         }
       }
       // Keep outdoorLux global in sync for telemetry packing
-      outdoorLux = (luxEma >= 0.0f) ? (int)luxEma : -99;
+      outdoorLux = (luxEma > 0.0f) ? (int)luxEma : -99;
       if (screenOn) displayBattLuxRow(tft, voltsBattADC, outdoorLux, bhSensorPresent);
     }
 
@@ -1308,6 +1325,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
             preferences.putInt("lux_on",  luxLightsOn);
             preferences.putInt("lux_off", luxLightsOff);
             Serial.printf("Lux thresholds updated: on=%d off=%d\n", luxLightsOn, luxLightsOff);
+            luxThresholdChanged = true;
           }
         }
         break;
