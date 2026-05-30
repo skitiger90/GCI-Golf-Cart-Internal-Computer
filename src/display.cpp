@@ -1,8 +1,15 @@
 /*
  * DISPLAY.CPP - Implementation of simple display functions
  *
- * Each function here handles ONE specific part of the display.
- * This makes it easy to update the display without duplicating code.
+ * Each function handles ONE row of the 240x135px display.
+ * All rows use font 2 (16px) for both labels and values.
+ *
+ * Layout (5 rows at 26px pitch):
+ *   Y=  4  MAC 90-38-0c-da-ce-90
+ *   Y= 30  PR  ec-e3-34-20-4b-b8  (or WAITING FOR PAIRING)
+ *   Y= 56  TEMP 78.5F   FUEL 0.728V
+ *   Y= 82  BATT 2.784V   LUX 121 LX
+ *   Y=108  GPIO EXPANDER 1-0-0   HL ON
  */
 
 #include "display.h"
@@ -12,122 +19,132 @@
 // ============================================================================
 
 void setLabelStyle(TFT_eSPI &tft) {
-    tft.setTextFont(2);                    // Small font
-    tft.setTextColor(COLOR_LABEL, TFT_BLACK);  // Cyan text
+    tft.setTextFont(2);
+    tft.setTextColor(COLOR_LABEL, TFT_BLACK);
 }
 
-void setValueStyle(TFT_eSPI &tft) {
-    tft.setTextFont(4);                    // Medium font
-    tft.setTextColor(COLOR_VALUE, TFT_BLACK);  // White text
+// Print MAC string replacing ':' separators with '-'
+static void printMacDashes(TFT_eSPI &tft, const char* mac) {
+    char buf[18];
+    int len = strlen(mac);
+    if (len > 17) len = 17;
+    for (int i = 0; i < len; i++)
+        buf[i] = (mac[i] == ':') ? '-' : mac[i];
+    buf[len] = '\0';
+    tft.print(buf);
 }
 
 // ============================================================================
-// LINE-BY-LINE DISPLAY FUNCTIONS
+// ROW FUNCTIONS
 // ============================================================================
 
-void displayMacLine(TFT_eSPI &tft, const char* macAddress) {
-    // Clear the line
-    tft.fillRect(0, MAC_LINE_Y, SCREEN_WIDTH, 26, TFT_BLACK);
-
-    // Draw label
+// Row 1: own device MAC address with dash separators
+void displayMacLine(TFT_eSPI &tft, const char* thisMac) {
+    tft.fillRect(0, MAC_LINE_Y, SCREEN_WIDTH, 20, TFT_BLACK);
     tft.setCursor(1, MAC_LINE_Y);
     setLabelStyle(tft);
-    tft.print("MAC");
-
-    // Draw value
-    setValueStyle(tft);
-    tft.println(macAddress);
+    tft.print("MAC ");
+    tft.setTextColor(COLOR_VALUE, TFT_BLACK);
+    printMacDashes(tft, thisMac);
 }
 
-void displayPairingLine(TFT_eSPI &tft, PairingStatus status, const char* pairedMac) {
-    // Clear the line
-    tft.fillRect(0, PAIRED_LINE_Y, SCREEN_WIDTH, 16, TFT_BLACK);
-    tft.setCursor(1, PAIRED_LINE_Y);
-
+// Row 2: paired MAC (green=connected, red=disconnected) or yellow WAITING message
+void displayPrLine(TFT_eSPI &tft, PairingStatus status, const char* pairedMac) {
+    tft.fillRect(0, PR_LINE_Y, SCREEN_WIDTH, 20, TFT_BLACK);
+    tft.setCursor(1, PR_LINE_Y);
     if (status == WAITING_FOR_PAIRING) {
-        // Show yellow "waiting" message
         tft.setTextFont(2);
         tft.setTextColor(COLOR_WAITING, TFT_BLACK);
-        tft.print("WAITING FOR PAIRING...");
+        tft.print("WAITING FOR PAIRING");
     } else {
-        // Show "PR" label
         setLabelStyle(tft);
-        tft.print("PR");
-
-        // Show MAC address in green (connected) or red (disconnected)
-        tft.setTextFont(4);
-        uint16_t color = (status == PAIRED_CONNECTED) ? COLOR_CONNECTED : COLOR_DISCONNECTED;
-        tft.setTextColor(color, TFT_BLACK);
-        tft.print(pairedMac);
+        tft.print("PR  ");
+        tft.setTextColor(
+            (status == PAIRED_CONNECTED) ? COLOR_CONNECTED : COLOR_DISCONNECTED,
+            TFT_BLACK);
+        printMacDashes(tft, pairedMac);
     }
 }
 
-void displayTempLine(TFT_eSPI &tft, float tempF, bool sensorConnected) {
-    // Clear the value area (keep label area)
-    tft.fillRect(60, TEMP_LINE_Y, 260, 18, TFT_BLACK);
+// Row 3: temperature and fuel voltage inline
+void displayTempFuelRow(TFT_eSPI &tft, float tempF, bool tempOk, float fuelV) {
+    tft.fillRect(0, SENSOR_LINE_Y, SCREEN_WIDTH, 20, TFT_BLACK);
 
-    // Draw label
-    tft.setCursor(1, TEMP_LINE_Y);
+    // TEMP (x=1)
+    tft.setCursor(1, SENSOR_LINE_Y);
     setLabelStyle(tft);
     tft.print("TEMP ");
-
-    // Draw value
-    setValueStyle(tft);
-    if (sensorConnected) {
-        tft.print(tempF);
-        tft.println(" F");  // Note: degree symbol removed for simplicity
+    tft.setTextColor(COLOR_VALUE, TFT_BLACK);
+    if (tempOk) {
+        tft.print(tempF, 1);
+        tft.print(" F");
     } else {
-        tft.println("No sensor");
+        tft.print("--");
+    }
+
+    // FUEL (x=95)
+    tft.setCursor(95, SENSOR_LINE_Y);
+    setLabelStyle(tft);
+    tft.print("FUEL ");
+    tft.setTextColor(COLOR_VALUE, TFT_BLACK);
+    tft.print(fuelV, 3);
+    tft.print(" V");
+}
+
+// Row 4: battery voltage and lux reading inline
+void displayBattLuxRow(TFT_eSPI &tft, float battV, int lux, bool sensorPresent) {
+    tft.fillRect(0, LUX_LINE_Y, SCREEN_WIDTH, 20, TFT_BLACK);
+
+    // BATT (x=1)
+    tft.setCursor(1, LUX_LINE_Y);
+    setLabelStyle(tft);
+    tft.print("BATT ");
+    tft.setTextColor(COLOR_VALUE, TFT_BLACK);
+    tft.print(battV, 3);
+    tft.print(" V");
+
+    // LUX (x=100) — "---" in dark grey when no BH1750
+    tft.setCursor(100, LUX_LINE_Y);
+    setLabelStyle(tft);
+    tft.print("LUX ");
+    if (sensorPresent && lux >= 0) {
+        tft.setTextColor(COLOR_VALUE, TFT_BLACK);
+        tft.print(lux);
+        tft.print(" LX");
+    } else {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.print("---");
     }
 }
 
-void displayFuelBattLine(TFT_eSPI &tft, float fuelVolts, float battVolts) {
-    // Clear only the fuel/batt area; leave FUEL_SENSE_LINE_Y and below for displayFuelSenseLine
-    tft.fillRect(0, FUEL_LINE_Y, SCREEN_WIDTH, FUEL_SENSE_LINE_Y - FUEL_LINE_Y, TFT_BLACK);
-
-    // FUEL label stacked: "FUEL" over "VOLT"
-    setLabelStyle(tft);
-    tft.setCursor(1, FUEL_LINE_Y);
-    tft.print("FUEL");
-    tft.setCursor(1, FUEL_LINE_Y + 16);
-    tft.print("VOLT");
-
-    // Fuel value — font 4 (26px tall) centered against the 32px stacked label
-    setValueStyle(tft);
-    tft.setCursor(40, FUEL_LINE_Y + 3);
-    tft.print(fuelVolts, 3);
-
-    // BATT label stacked: "BATT" over "VOLT"
-    setLabelStyle(tft);
-    tft.setCursor(130, FUEL_LINE_Y);
-    tft.print("BATT");
-    tft.setCursor(130, FUEL_LINE_Y + 16);
-    tft.print("VOLT");
-
-    // Batt value
-    setValueStyle(tft);
-    tft.setCursor(168, FUEL_LINE_Y + 3);
-    tft.print(battVolts, 3);
-}
-
-void displayFuelSenseLine(TFT_eSPI &tft, int sensorType, uint8_t gpPins) {
+// Row 5: fuel sensor type with dashes between GPIO bits, HL relay state at right
+void displayFuelSenseLine(TFT_eSPI &tft, int sensorType, uint8_t gpPins, bool hlOn) {
     tft.fillRect(0, FUEL_SENSE_LINE_Y, SCREEN_WIDTH, SCREEN_HEIGHT - FUEL_SENSE_LINE_Y, TFT_BLACK);
     tft.setCursor(1, FUEL_SENSE_LINE_Y);
     tft.setTextFont(2);
     tft.setTextColor(COLOR_LABEL, TFT_BLACK);
     switch (sensorType) {
-        case 0: tft.print("NO SENSOR");  break;
-        case 1: tft.print("ADC GAS");    break;
-        case 3: tft.print("ADC ELEC");   break;
+        case 0: tft.print("NO FUEL SENSOR"); break;
+        case 1: tft.print("ADC GAS");        break;
+        case 3: tft.print("ADC ELECTRIC");   break;
         case 2: {
-            char buf[24];
-            snprintf(buf, sizeof(buf), "GPIO EXPANDER %d%d%d",
+            tft.print("GPIO EXPANDER ");
+            tft.setTextColor(COLOR_VALUE, TFT_BLACK);
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d-%d-%d",
                      (gpPins >> 0) & 1, (gpPins >> 1) & 1, (gpPins >> 2) & 1);
             tft.print(buf);
             break;
         }
         default: tft.print("UNKNOWN"); break;
     }
+
+    // HL relay state at x=175
+    tft.setCursor(175, FUEL_SENSE_LINE_Y);
+    setLabelStyle(tft);
+    tft.print("HL ");
+    tft.setTextColor(hlOn ? TFT_GREEN : COLOR_VALUE, TFT_BLACK);
+    tft.print(hlOn ? "ON" : "OFF");
 }
 
 // ============================================================================
@@ -138,33 +155,17 @@ void clearScreen(TFT_eSPI &tft) {
     tft.fillScreen(TFT_BLACK);
 }
 
-void redrawAllLines(TFT_eSPI &tft, const char* thisMac, PairingStatus status,
-                    const char* pairedMac, float tempF, bool sensorConnected,
-                    float fuelVolts, float battVolts) {
-    // Redraw each line of the display
-    displayMacLine(tft, thisMac);
-    displayPairingLine(tft, status, pairedMac);
-    displayTempLine(tft, tempF, sensorConnected);
-    displayFuelBattLine(tft, fuelVolts, battVolts);
-}
-
 void displaySplashScreen(TFT_eSPI &tft, const char* version) {
-    // Clear screen
     tft.fillScreen(TFT_BLACK);
 
-    // Get actual screen width after rotation
     int16_t screenWidth = tft.width();
-
-    // Use top-center datum for centered text
     tft.setTextDatum(TC_DATUM);
 
-    // Draw "GCI" in large yellow font, centered
     tft.setTextFont(4);
-    tft.setTextSize(2);  // Double size for large text
+    tft.setTextSize(2);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
     tft.drawString("GCI", screenWidth / 2, 20);
 
-    // Draw "Ver. x.x.x" in white, centered below
     tft.setTextSize(1);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
@@ -172,13 +173,8 @@ void displaySplashScreen(TFT_eSPI &tft, const char* version) {
     snprintf(versionLine, sizeof(versionLine), "Ver. %s", version);
     tft.drawString(versionLine, screenWidth / 2, 85);
 
-    // Reset datum to top-left for other functions
     tft.setTextDatum(TL_DATUM);
-
-    // Display for 2.5 seconds
     delay(2500);
-
-    // Clear screen before returning
     tft.fillScreen(TFT_BLACK);
-    tft.setTextSize(1);  // Reset to default size
+    tft.setTextSize(1);
 }

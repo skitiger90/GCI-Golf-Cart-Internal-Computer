@@ -421,6 +421,7 @@ void setup(void) {
   // Display this device's MAC address
   createMacAddressStr(thisDeviceMacStr);
   displayMacLine(tft, thisDeviceMacStr);
+  displayPrLine(tft, WAITING_FOR_PAIRING, "");
   Serial.println(thisDeviceMacStr);     // Display on Serial
 
   // Init ESP-NOW
@@ -512,13 +513,14 @@ void setup(void) {
       peerInfo.encrypt = false;
 
       if (esp_now_add_peer(&peerInfo) == ESP_OK) {
-        sprintf(pairedMacStr, "%02x:%02x:%02x:%02x:%02x:%02x",
+        sprintf(pairedMacStr, "%02X:%02X:%02X:%02X:%02X:%02X",
                 savedMac[0], savedMac[1], savedMac[2],
                 savedMac[3], savedMac[4], savedMac[5]);
         Serial.printf("Loaded saved peer: %s\n", pairedMacStr);
 
         // Display paired status (starts RED until heartbeat received)
-        displayPairingLine(tft, PAIRED_DISCONNECTED, pairedMacStr);
+        displayMacLine(tft, thisDeviceMacStr);
+        displayPrLine(tft, PAIRED_DISCONNECTED, pairedMacStr);
 
         hasSavedPeer = true;
       }
@@ -529,7 +531,8 @@ void setup(void) {
     Serial.println("No saved peer - waiting for pairing commands from GCD");
 
     // Display pairing status
-    displayPairingLine(tft, WAITING_FOR_PAIRING, "");
+    displayMacLine(tft, thisDeviceMacStr);
+    displayPrLine(tft, WAITING_FOR_PAIRING, "");
   }
   screenStartTime = millis();   // Record screen start time
 
@@ -744,7 +747,7 @@ void loop() {
   // Update display if connection status changed
   if (hasPeer && (isConnected != lastConnectionStatus) && strlen(pairedMacStr) > 0) {
     PairingStatus status = isConnected ? PAIRED_CONNECTED : PAIRED_DISCONNECTED;
-    displayPairingLine(tft, status, pairedMacStr);
+    displayPrLine(tft, status, pairedMacStr);
   }
 
   lastConnectionStatus = isConnected;
@@ -882,6 +885,7 @@ void loop() {
       }
       // Keep outdoorLux global in sync for telemetry packing
       outdoorLux = (luxEma >= 0.0f) ? (int)luxEma : -99;
+      if (screenOn) displayBattLuxRow(tft, voltsBattADC, outdoorLux, bhSensorPresent);
     }
 
     // Check if telemetry should be sent
@@ -940,9 +944,9 @@ void loop() {
   bool displayDue = sendData || (screenOn && (millis() - lastDisplayUpdateTime) >= DISPLAY_UPDATE_INTERVAL_MS);
   if (displayDue) {
     bool sensorConnected = (tempC_0 != DEVICE_DISCONNECTED_C);
-    displayTempLine(tft, tempF_0, sensorConnected);
-    displayFuelBattLine(tft, voltsFuelADC, voltsBattADC);
-    displayFuelSenseLine(tft, gciFuelSenseType, lastMcpPins);
+    displayTempFuelRow(tft, tempF_0, sensorConnected, voltsFuelADC);
+    displayBattLuxRow(tft, voltsBattADC, outdoorLux, bhSensorPresent);
+    displayFuelSenseLine(tft, gciFuelSenseType, lastMcpPins, headlightsOn);
     lastDisplayUpdateTime = millis();
   }
 
@@ -950,7 +954,7 @@ void loop() {
   if (sendData) {
     char gcdMacStr[18];
     if (hasPeer) {
-      sprintf(gcdMacStr, "%02x:%02x:%02x:%02x:%02x:%02x",
+      sprintf(gcdMacStr, "%02X:%02X:%02X:%02X:%02X:%02X",
               peer.peer_addr[0], peer.peer_addr[1], peer.peer_addr[2],
               peer.peer_addr[3], peer.peer_addr[4], peer.peer_addr[5]);
     }
@@ -1004,15 +1008,15 @@ bool hasSignificantTelemetryChange(float battVolts, float airTemp, float fuel, i
 }
 
 void redrawDisplayHeader() {
-  // Redraw MAC address line
-  displayMacLine(tft, thisDeviceMacStr);
-
-  // Redraw paired status line if we have a peer
+  PairingStatus status;
   if (strlen(pairedMacStr) > 0) {
     bool isConnected = (consecutiveHeartbeatsMissed < HEARTBEAT_MISS_THRESHOLD);
-    PairingStatus status = isConnected ? PAIRED_CONNECTED : PAIRED_DISCONNECTED;
-    displayPairingLine(tft, status, pairedMacStr);
+    status = isConnected ? PAIRED_CONNECTED : PAIRED_DISCONNECTED;
+  } else {
+    status = WAITING_FOR_PAIRING;
   }
+  displayMacLine(tft, thisDeviceMacStr);
+  displayPrLine(tft, status, pairedMacStr);
 }
 
 void BeforeSleeping() {
@@ -1065,7 +1069,7 @@ void createMacAddressStr(char* MacStr){
   esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, baseMac);
   if (ret == ESP_OK) {
 
-    sprintf(MacStr, "%02x:%02x:%02x:%02x:%02x:%02x",
+    sprintf(MacStr, "%02X:%02X:%02X:%02X:%02X:%02X",
             baseMac[0], baseMac[1], baseMac[2],
             baseMac[3], baseMac[4], baseMac[5]);
   }
@@ -1111,7 +1115,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
       uint8_t newPeerMac[6];
       memcpy(newPeerMac, dataFromGcd.macAddr, 6);
 
-      sprintf(pairedMacStr, "%02x:%02x:%02x:%02x:%02x:%02x",
+      sprintf(pairedMacStr, "%02X:%02X:%02X:%02X:%02X:%02X",
               newPeerMac[0], newPeerMac[1], newPeerMac[2],
               newPeerMac[3], newPeerMac[4], newPeerMac[5]);
 
@@ -1132,7 +1136,8 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
           Serial.println("Saved peer MAC to EEPROM");
 
           // Update display to show paired status (GREEN since we just received a message)
-          displayPairingLine(tft, PAIRED_CONNECTED, pairedMacStr);
+          displayMacLine(tft, thisDeviceMacStr);
+          displayPrLine(tft, PAIRED_CONNECTED, pairedMacStr);
 
           // Send ACK back to GCD in WRAPPED mode
           espnow_message_t ackMsg;
@@ -1173,7 +1178,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     espnow_message_t* msg = (espnow_message_t*)incomingData;
 
     char mac_str[18];
-    sprintf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x",
+    sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     Serial.printf("Received %s from %s\n",
@@ -1222,7 +1227,8 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
                              newPeerMac[3], newPeerMac[4], newPeerMac[5]);
 
                 // Update display to show paired status (connected since we just received message)
-                displayPairingLine(tft, PAIRED_CONNECTED, mac_str);
+                displayMacLine(tft, thisDeviceMacStr);
+                displayPrLine(tft, PAIRED_CONNECTED, mac_str);
               } else {
                 Serial.println("Failed to add peer");
               }
