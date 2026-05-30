@@ -15,7 +15,7 @@
 #include "display.h"
 #include "version.h"
 
-#define SCREEN_TIMEOUT 90 // seconds
+#define SCREEN_TIMEOUT 120 // seconds
 #define PAIRED_MAC_MSG_TIMEOUT 5 // seconds
 #define BUTTON_HOLD_ERASE_SECS 5 // seconds to hold button to erase paired MAC
 
@@ -84,9 +84,11 @@ typedef enum {
     ESPNOW_MSG_CONFIG = 8  // GCD → GCI configuration (must match GCD)
 } espnow_msg_type_t;
 
-// Config message payload (must match GCD)
+// Config message payload (must match GCD src/types.h)
 typedef struct __attribute__((packed)) {
     int32_t fuelSensorType;
+    int32_t luxLightsOn;   // lux threshold to turn headlights ON
+    int32_t luxLightsOff;  // lux threshold to turn headlights OFF
 } structMsgConfig;
 
 // ESP-NOW message structure (must match GCD)
@@ -135,7 +137,7 @@ unsigned long lastHeartbeatCheckTime = 0;
 // -99 indicates invalid/not installed
 // variables for outbound data
 int modeHeadLights = -99;
-int outdoorLuminosity = -99;
+int outdoorLux = -99;
 float airTemperature = -99;
 float battVoltage = -99;
 
@@ -161,6 +163,15 @@ float prevFuelLevel = 100.0f;
 bool is_home = false;      // True when GCD is within home geo-fence
 bool is_daylight = true;   // True during daytime (between sunrise/sunset)
 
+// BH1750 lux sensor and headlight relay state
+bool  bhSensorPresent   = false;
+float luxEma            = -99.0f;  // EMA-filtered lux; -99 = not yet valid
+bool  headlightsOn      = false;
+int   luxLightsOn       = 200;     // lux threshold to turn headlights ON  (loaded from NVS)
+int   luxLightsOff      = 400;     // lux threshold to turn headlights OFF (loaded from NVS)
+int   lastLuxSent       = -999;    // last outdoorLux value transmitted; for change-detection
+unsigned long lastLuxSampleTime = 0;
+
 // Golf cart command codes (must match GCD)
 typedef enum {
     GCI_CMD_NONE = 0,
@@ -172,7 +183,7 @@ typedef enum {
 
 typedef struct struct_msg_to_gcd {
   int modeLights;
-  int outdoorLum;
+  int outdoorLux;
   float airTemp;
   float battVolts;
   float fuelPct;
@@ -240,6 +251,30 @@ void initMCP23008() {
   Wire.requestFrom((uint8_t)I2C_ADDR_MCP23008, (uint8_t)1);
   uint8_t iodir = Wire.available() ? Wire.read() : 0xFF;
   Serial.printf("MCP23008 initialized (IODIR readback=0x%02X)\n", iodir);
+}
+
+// Probe I2C address 0x23 for BH1750; if present, write Continuous High Resolution Mode 1.
+// Sets bhSensorPresent. Safe to call even when sensor is absent.
+void initBH1750() {
+  Wire.beginTransmission(I2C_ADDR_BH1750);
+  uint8_t err = Wire.endTransmission();
+  if (err != 0) {
+    Serial.printf("BH1750: not found (I2C err=%d)\n", err);
+    return;
+  }
+  Wire.beginTransmission(I2C_ADDR_BH1750);
+  Wire.write(0x10);  // Continuous High Resolution Mode 1: ~1 lux resolution, 120ms/sample
+  err = Wire.endTransmission();
+  bhSensorPresent = (err == 0);
+  Serial.printf("BH1750: %s\n", bhSensorPresent ? "initialized" : "mode write failed");
+}
+
+// Read one 2-byte sample from BH1750 and return lux (raw / 1.2 per datasheet).
+// Returns -1.0 on I2C failure; caller should discard and retain previous EMA.
+float readBH1750Lux() {
+  if (Wire.requestFrom((uint8_t)I2C_ADDR_BH1750, (uint8_t)2) != 2) return -1.0f;
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+  return raw / 1.2f;
 }
 
 // Full runtime recovery: release Wire, bit-bang bus clear, restart Wire, re-init chip.
@@ -428,6 +463,11 @@ void setup(void) {
   gciFuelSenseType = preferences.getInt("fuel_sense_type", FUEL_SENSOR_NONE);
   Serial.printf("Fuel sense type: %d\n", gciFuelSenseType);
 
+  // Load BH1750 lux thresholds (GCD pushes updates via ESPNOW_MSG_CONFIG)
+  luxLightsOn  = preferences.getInt("lux_on",  200);
+  luxLightsOff = preferences.getInt("lux_off", 400);
+  Serial.printf("Lux thresholds: on=%d off=%d\n", luxLightsOn, luxLightsOff);
+
   i2cBusRecover();
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQUENCY);
   {
@@ -444,6 +484,7 @@ void setup(void) {
   }
   if (gciFuelSenseType == FUEL_SENSOR_GPIO_EXP)
     initMCP23008();
+  initBH1750();
 
   // Try to load saved peer MAC address
   uint8_t savedMac[6] = {0};
@@ -811,9 +852,42 @@ void loop() {
         break;
     }
 
+    // Sample BH1750 and control headlight relay every 1 s
+    if (millis() - lastLuxSampleTime >= 1000) {
+      lastLuxSampleTime = millis();
+      if (bhSensorPresent) {
+        float raw = readBH1750Lux();
+        if (raw >= 0.0f)
+          luxEma = (luxEma < 0.0f) ? raw : (0.3f * raw + 0.7f * luxEma);
+        // Hysteresis: turn ON below luxLightsOn, turn OFF above luxLightsOff
+        if (luxEma >= 0.0f && luxEma < (float)luxLightsOn && !headlightsOn) {
+          headlightsOn = true;
+          digitalWrite(RELAY1_PIN, HIGH);
+          Serial.printf("Headlights ON (lux=%.0f < %d)\n", luxEma, luxLightsOn);
+        } else if (luxEma >= (float)luxLightsOff && headlightsOn) {
+          headlightsOn = false;
+          digitalWrite(RELAY1_PIN, LOW);
+          Serial.printf("Headlights OFF (lux=%.0f >= %d)\n", luxEma, luxLightsOff);
+        }
+        modeHeadLights = headlightsOn ? 1 : 0;
+      } else {
+        // No sensor: follow is_daylight broadcast from GCD
+        bool wanted = !is_daylight;
+        if (wanted != headlightsOn) {
+          headlightsOn = wanted;
+          digitalWrite(RELAY1_PIN, headlightsOn ? HIGH : LOW);
+          modeHeadLights = headlightsOn ? 1 : 0;
+          Serial.printf("Headlights %s (is_daylight=%d)\n", headlightsOn ? "ON" : "OFF", is_daylight);
+        }
+      }
+      // Keep outdoorLux global in sync for telemetry packing
+      outdoorLux = (luxEma >= 0.0f) ? (int)luxEma : -99;
+    }
+
     // Check if telemetry should be sent
     // Send when: data changed, screen turned on, initial connection, or after missed heartbeat when reconnected
-    bool dataChanged = sendData || refreshTelemetry || hasSignificantTelemetryChange(voltsBattADC, tempF_0, smoothedFuel, modeHeadLights);
+    bool luxChanged = bhSensorPresent && (abs(outdoorLux - lastLuxSent) > 50);
+    bool dataChanged = sendData || refreshTelemetry || luxChanged || hasSignificantTelemetryChange(voltsBattADC, tempF_0, smoothedFuel, modeHeadLights);
     bool resendAfterMissedHeartbeat = heartbeatMissed && (consecutiveHeartbeatsMissed == 0);
 
     // Check if minimum interval has elapsed since last send
@@ -826,10 +900,11 @@ void loop() {
       prevAirTemperature = tempF_0;
       prevFuelLevel = smoothedFuel;
       prevModeHeadLights = modeHeadLights;
+      lastLuxSent = outdoorLux;
 
       // stuff the dataToGcd structure for transmission
       dataToGcd.modeLights = modeHeadLights;
-      dataToGcd.outdoorLum = outdoorLuminosity;
+      dataToGcd.outdoorLux = outdoorLux;
       dataToGcd.airTemp = tempF_0;
       dataToGcd.battVolts = voltsBattADC;
       dataToGcd.fuelPct = smoothedFuel;
@@ -879,9 +954,9 @@ void loop() {
               peer.peer_addr[0], peer.peer_addr[1], peer.peer_addr[2],
               peer.peer_addr[3], peer.peer_addr[4], peer.peer_addr[5]);
     }
-    Serial.printf("Telemetry to %s : Lights=%d, Lum=%d, Temp=%.1f, Batt=%.2f, Fuel=%.1f\n",
+    Serial.printf("Telemetry to %s : Lights=%d, Lux=%d, Temp=%.1f, Batt=%.2f, Fuel=%.1f\n",
                   hasPeer ? gcdMacStr : "No Peer",
-                  modeHeadLights, outdoorLuminosity, tempF_0, voltsBattADC, smoothedFuel);
+                  modeHeadLights, outdoorLux, tempF_0, voltsBattADC, smoothedFuel);
     sendData = false;
   }
 
@@ -1213,14 +1288,21 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         break;
 
       case ESPNOW_MSG_CONFIG:
-        if (msg->data_len >= (int)sizeof(structMsgConfig)) {
-          structMsgConfig cfg;
-          memcpy(&cfg, msg->data, sizeof(cfg));
+        if (msg->data_len >= (int)sizeof(int32_t)) {  // at minimum fuelSensorType
+          structMsgConfig cfg = {};
+          memcpy(&cfg, msg->data, min((int)msg->data_len, (int)sizeof(cfg)));
           gciFuelSenseType = cfg.fuelSensorType;
           preferences.putInt("fuel_sense_type", gciFuelSenseType);
           Serial.printf("Received fuel_sense_type=%d, saved to NVS\n", gciFuelSenseType);
           if (gciFuelSenseType == FUEL_SENSOR_GPIO_EXP)
             initMCP23008();
+          if (msg->data_len >= (int)sizeof(structMsgConfig)) {
+            luxLightsOn  = (int)cfg.luxLightsOn;
+            luxLightsOff = (int)cfg.luxLightsOff;
+            preferences.putInt("lux_on",  luxLightsOn);
+            preferences.putInt("lux_off", luxLightsOff);
+            Serial.printf("Lux thresholds updated: on=%d off=%d\n", luxLightsOn, luxLightsOff);
+          }
         }
         break;
 
