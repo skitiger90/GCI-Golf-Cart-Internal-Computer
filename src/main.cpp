@@ -32,7 +32,10 @@
 // LiFePO4 16S pack voltage breakpoints (fixed by cell chemistry — 2.5/3.25/3.3325V per cell × 16)
 #define ELEC_EMPTY_V  40.0f   // 0%   — 2.5V/cell × 16
 #define ELEC_KNEE_V   52.0f   // 25%  — 3.25V/cell × 16, plateau start
-#define ELEC_FULL_V              53.32f  // 100% — 3.3325V/cell × 16, resting full; above this clamps to 100% (covers charging 58–60V)
+#define ELEC_FULL_V              53.20f  // 100% — measured resting full on this pack; above this clamps to 100% (covers charging 58–60V)
+// Measured calibration 2026-06-05: 2.684 V ADC → 53.20 V pack (100% SOC)
+// Ratio 53.20/2.684 = 19.821 (replaces nominal 1056000/56000 = 18.857)
+#define ELEC_BATT_DIVIDER        (53.20f / 2.684f)
 #define ELEC_SAMPLE_INTERVAL_MS  2000    // 2s EMA tick
 #define ELEC_EMA_ALPHA           0.1f    // τ ≈ 10 samples (~20s); plateau maps 1mV→~0.057% SOC, low α needed
 #define ELEC_DEADBAND            3.0f    // min EMA deviation to update reported smoothedFuel; suppresses plateau ADC noise
@@ -52,6 +55,7 @@
 #define RELAY4_PIN 14 // unused
 
 #define DEBUG_MCP23008 0  // 1 = log every pin read; 0 = log GP changes only
+#define DEBUG_ADC_ELEC 0  // 1 = log adcMv/battV/pct/ema every 2s; 0 = silent (telemetry line shows sent value)
 
 // i2c configuration
 #define I2C_SDA_PIN 21
@@ -547,7 +551,6 @@ void setup(void) {
 void loop() {
 
   static float tempC_0, tempF_0;
-  static int rawFuelADC, rawBattADC;
   static float voltsFuelADC, voltsBattADC;
   static int percentFuel;
   static bool sendData = false;
@@ -761,13 +764,9 @@ void loop() {
     tempC_0 = sensors.getTempCByIndex(0);
     tempF_0 = tempC_0 * 9.0 / 5.0 + 32.0;
 
-    // Read ADC values
-    rawFuelADC = analogRead(ADC_FUEL_PIN);
-    rawBattADC = analogRead(ADC_BATTERY_PIN);
-
-    // Convert ADC values to volts (0-4095 -> 0-3.3V)
-    voltsFuelADC = (rawFuelADC / 4095.0) * 3.3;
-    voltsBattADC = (rawBattADC / 4095.0) * 3.3;
+    // Read ADC values — analogReadMilliVolts applies esp_adc_cal factory correction
+    voltsFuelADC = analogReadMilliVolts(ADC_FUEL_PIN)   / 1000.0f;
+    voltsBattADC = analogReadMilliVolts(ADC_BATTERY_PIN) / 1000.0f;
 
     // Select fuel sensing algorithm based on configured sensor type
     switch (gciFuelSenseType) {
@@ -808,7 +807,31 @@ void loop() {
       }
 
       case FUEL_SENSOR_ADC_ELEC: {
-        float actualBattV = voltsBattADC * (1056000.0f / 56000.0f);
+        // Calibration table: {reported battV, correction_V}
+        // correction = actual_multimeter_V - reported_battV (measured at rest, no load/charge)
+        // Keep entries in ascending battV order; 3-5 points across 40-53 V is sufficient.
+        static const struct { float battV; float corrV; } ELEC_CAL[] = {
+          {53.20f,  0.00f},   // 100% — measured 2026-06-05
+          // {52.00f,  0.00f}, // 25% knee — uncomment and fill corrV after measuring
+          // {40.00f,  0.00f}, // 0%       — uncomment and fill corrV after measuring
+        };
+        static const int ELEC_CAL_N = (int)(sizeof(ELEC_CAL) / sizeof(ELEC_CAL[0]));
+        float raw = voltsBattADC * ELEC_BATT_DIVIDER;
+        float actualBattV;
+        if (ELEC_CAL_N == 1 || raw <= ELEC_CAL[0].battV) {
+          actualBattV = raw + ELEC_CAL[0].corrV;
+        } else if (raw >= ELEC_CAL[ELEC_CAL_N-1].battV) {
+          actualBattV = raw + ELEC_CAL[ELEC_CAL_N-1].corrV;
+        } else {
+          actualBattV = raw;
+          for (int i = 1; i < ELEC_CAL_N; i++) {
+            if (raw < ELEC_CAL[i].battV) {
+              float t = (raw - ELEC_CAL[i-1].battV) / (ELEC_CAL[i].battV - ELEC_CAL[i-1].battV);
+              actualBattV = raw + ELEC_CAL[i-1].corrV + t * (ELEC_CAL[i].corrV - ELEC_CAL[i-1].corrV);
+              break;
+            }
+          }
+        }
         float pct;
         if      (actualBattV <= ELEC_EMPTY_V) pct = 0.0f;
         else if (actualBattV <  ELEC_KNEE_V)  pct = (actualBattV - ELEC_EMPTY_V) / (ELEC_KNEE_V - ELEC_EMPTY_V) * 25.0f;
@@ -824,7 +847,10 @@ void loop() {
             if (fabsf(elecEma - smoothedFuel) >= ELEC_DEADBAND)
               smoothedFuel = elecEma;
           }
-          Serial.printf("ADC_ELEC: battV=%.2fV pct=%.1f%% ema=%.1f%% reported=%.1f%%\n", actualBattV, pct, elecEma, smoothedFuel);
+#if DEBUG_ADC_ELEC
+          Serial.printf("ADC_ELEC: adcMv=%d battV=%.3fV pct=%.1f%% ema=%.1f%% reported=%.1f%%\n",
+                        (int)(voltsBattADC * 1000.0f), actualBattV, pct, elecEma, smoothedFuel);
+#endif
         }
         break;
       }
