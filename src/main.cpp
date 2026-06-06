@@ -90,7 +90,8 @@ typedef enum {
     ESPNOW_MSG_HEARTBEAT = 5,
     ESPNOW_MSG_IS_HOME = 6,
     ESPNOW_MSG_IS_DAYTIME = 7,
-    ESPNOW_MSG_CONFIG = 8  // GCD → GCI configuration (must match GCD)
+    ESPNOW_MSG_CONFIG = 8,        // GCD → GCI configuration (must match GCD)
+    ESPNOW_MSG_GCI_VERSION = 9   // GCI → GCD version string
 } espnow_msg_type_t;
 
 // Config message payload (must match GCD src/types.h)
@@ -1044,9 +1045,23 @@ void loop() {
   }
 
   // Update display if connection status changed
-  if (hasPeer && (isConnected != lastConnectionStatus) && strlen(pairedMacStr) > 0) {
+  if (!splashDisplayed && hasPeer && (isConnected != lastConnectionStatus) && strlen(pairedMacStr) > 0) {
     PairingStatus status = isConnected ? PAIRED_CONNECTED : PAIRED_DISCONNECTED;
     displayPrLine(tft, status, pairedMacStr);
+
+    // On connection, send our version string to GCD
+    if (isConnected) {
+      espnow_message_t verMsg;
+      verMsg.type = ESPNOW_MSG_GCI_VERSION;
+      verMsg.timestamp = millis();
+      verMsg.msg_seq_num = next_msg_seq_num++;
+      char ver[24];
+      snprintf(ver, sizeof(ver), "v%s", VERSION);
+      verMsg.data_len = strlen(ver);
+      memcpy(verMsg.data, ver, verMsg.data_len);
+      esp_now_send(peer.peer_addr, (uint8_t*)&verMsg, ESPNOW_PACKET_SIZE(verMsg.data_len));
+      if (!cliActive) Serial.printf("Sent GCI version to GCD: %s\n", ver);
+    }
   }
 
   lastConnectionStatus = isConnected;
@@ -1057,7 +1072,7 @@ void loop() {
     // Read temperature sensor
     sensors.requestTemperatures();
     tempC_0 = sensors.getTempCByIndex(0);
-    tempF_0 = tempC_0 * 9.0 / 5.0 + 32.0;
+    tempF_0 = (tempC_0 == DEVICE_DISCONNECTED_C) ? -99.0f : (tempC_0 * 9.0 / 5.0 + 32.0);
 
     // Read ADC values — analogReadMilliVolts applies esp_adc_cal factory correction
     voltsFuelADC = analogReadMilliVolts(ADC_FUEL_PIN)   / 1000.0f;
@@ -1209,7 +1224,7 @@ void loop() {
       }
       // Keep outdoorLux global in sync for telemetry packing
       outdoorLux = (luxEma > 0.0f) ? (int)luxEma : -99;
-      if (screenOn) displayBattLuxRow(tft, voltsBattADC, outdoorLux, bhSensorPresent);
+      if (screenOn && !splashDisplayed) displayBattLuxRow(tft, voltsBattADC, outdoorLux, bhSensorPresent);
     }
 
     // Check if telemetry should be sent
@@ -1265,7 +1280,8 @@ void loop() {
   }
 
   // Update display on 1-second timer OR immediately on sendData (button press / telemetry sent)
-  bool displayDue = sendData || (screenOn && (millis() - lastDisplayUpdateTime) >= DISPLAY_UPDATE_INTERVAL_MS);
+  // Skip while splash screen is shown so data rows don't overwrite it
+  bool displayDue = !splashDisplayed && (sendData || (screenOn && (millis() - lastDisplayUpdateTime) >= DISPLAY_UPDATE_INTERVAL_MS));
   if (displayDue) {
     bool sensorConnected = (tempC_0 != DEVICE_DISCONNECTED_C);
     displayTempFuelRow(tft, tempF_0, sensorConnected, voltsFuelADC);
@@ -1628,6 +1644,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
           memcpy(response.data, &response.timestamp, 4);
 
           esp_now_send(mac, (uint8_t*)&response, ESPNOW_PACKET_SIZE(4));
+
         }
         break;
 
