@@ -29,17 +29,17 @@
 #define FUEL_RESET_DELTA_THRESHOLD 25.0f // % jump that flushes the rolling buffer for fast large-change response
 #define GPIO_EXP_CONFIRM_COUNT  5       // consecutive matching reads required before committing a new GPIO EXPANDER level (~500ms at 100ms loop)
 
-// LiFePO4 16S pack voltage breakpoints (fixed by cell chemistry — 2.5/3.25/3.3325V per cell × 16)
-#define ELEC_EMPTY_V  40.0f   // 0%   — 2.5V/cell × 16
-#define ELEC_KNEE_V   52.0f   // 25%  — 3.25V/cell × 16, plateau start
-#define ELEC_FULL_V              53.20f  // 100% — measured resting full on this pack; above this clamps to 100% (covers charging 58–60V)
-// Measured calibration 2026-06-05: 2.684 V ADC → 53.20 V pack (100% SOC)
-// Ratio 53.20/2.684 = 19.821 (replaces nominal 1056000/56000 = 18.857)
-#define ELEC_BATT_DIVIDER        (53.20f / 2.684f)
+// LiFePO4 16S pack voltage breakpoints
+#define ELEC_EMPTY_V  40.0f   // 0%   — 2.5V/cell × 16, BMS cutoff floor
+#define ELEC_FULL_V   53.20f  // 100% — measured resting full on this pack; above this clamps to 100%
+// Factory default calibration: 2.690 V ADC → 53.20 V pack (100% SOC)
+#define ELEC_BATT_DIVIDER        (53.20f / 2.690f)   // = 19.777
 #define ELEC_SAMPLE_INTERVAL_MS  2000    // 2s EMA tick
 #define ELEC_EMA_ALPHA           0.1f    // τ ≈ 10 samples (~20s); plateau maps 1mV→~0.057% SOC, low α needed
 #define ELEC_DEADBAND            3.0f    // min EMA deviation to update reported smoothedFuel; suppresses plateau ADC noise
 #define ELEC_CAL_MAX             8       // max correction table entries
+// Bump ELEC_CAL_VERSION when changing factory defaults; add a new "if (calVer < N)" migration block in setup().
+#define ELEC_CAL_VERSION         1
 
 struct ElecCalPt { float packV; float pct; };
 
@@ -373,6 +373,8 @@ int readMCP23008Fuel() {
  *    SETUP   *
  **************/
 
+static void sortElecCal();  // defined after setup(); forward-declared so migration in setup() can call it
+
 void setup(void) {
   Serial.begin(9600);
   Serial.println("\n=== GCI BOOT ===");
@@ -500,13 +502,49 @@ void setup(void) {
       preferences.getBytes("elec_cal_pts", elecCal, n * sizeof(ElecCalPt));
       elecCalN = n;
     } else {
-      elecCalN   = 3;
-      elecCal[0] = {40.00f,   0.0f};   // 0%  — knee floor  (ELEC_EMPTY_V)
-      elecCal[1] = {52.00f,  25.0f};   // 25% — knee exit   (ELEC_KNEE_V)
-      elecCal[2] = {53.20f, 100.0f};   // 100% — flat plateau top (ELEC_FULL_V)
+      // Fresh NVS: write current factory defaults (4-point LiFePO4 knee curve).
+      elecCalN   = 4;
+      elecCal[0] = {40.00f,   0.0f};   // 0%  — BMS cutoff floor
+      elecCal[1] = {48.00f,  10.0f};   // 10% — lower knee (LiFePO4 steep rise from cutoff)
+      elecCal[2] = {51.20f,  20.0f};   // 20% — knee exit, entering flat plateau
+      elecCal[3] = {53.20f, 100.0f};   // 100% — measured anchor (2690 mV ADC)
+      preferences.putInt("elec_cal_ver", ELEC_CAL_VERSION);
+      preferences.putInt("elec_cal_n", elecCalN);
+      preferences.putBytes("elec_cal_pts", elecCal, elecCalN * sizeof(ElecCalPt));
+      preferences.putFloat("elec_divider", elecDivider);  // save compile-time default so CLI adcMv column is correct
     }
     float nvsDivider = preferences.getFloat("elec_divider", 0.0f);
     if (nvsDivider > 5.0f) elecDivider = nvsDivider;
+
+    // Version migration: upgrade old factory defaults while preserving user-entered entries.
+    int calVer = preferences.getInt("elec_cal_ver", 0);
+    if (calVer < ELEC_CAL_VERSION) {
+      // V0→V1: remove old factory 25% = 52.00V knee entry (not real user data).
+      for (int i = 0; i < elecCalN; i++) {
+        if (fabsf(elecCal[i].pct - 25.0f) < 1.0f && fabsf(elecCal[i].packV - 52.00f) < 0.1f) {
+          for (int j = i; j < elecCalN - 1; j++) elecCal[j] = elecCal[j+1];
+          elecCalN--;
+          break;
+        }
+      }
+      // Add improved LiFePO4 knee points if not already present and space allows.
+      bool has10 = false, has20 = false;
+      for (int i = 0; i < elecCalN; i++) {
+        if (fabsf(elecCal[i].pct - 10.0f) < 1.0f) has10 = true;
+        if (fabsf(elecCal[i].pct - 20.0f) < 1.0f) has20 = true;
+      }
+      if (!has10 && elecCalN < ELEC_CAL_MAX) elecCal[elecCalN++] = {48.00f, 10.0f};
+      if (!has20 && elecCalN < ELEC_CAL_MAX) elecCal[elecCalN++] = {51.20f, 20.0f};
+      sortElecCal();
+      // Reset divider if it still matches the old factory default (53.20/2.684 = 19.821).
+      if (fabsf(elecDivider - (53.20f / 2.684f)) < 0.01f) {
+        elecDivider = ELEC_BATT_DIVIDER;
+        preferences.putFloat("elec_divider", elecDivider);
+      }
+      preferences.putInt("elec_cal_ver", ELEC_CAL_VERSION);
+      preferences.putInt("elec_cal_n", elecCalN);
+      preferences.putBytes("elec_cal_pts", elecCal, elecCalN * sizeof(ElecCalPt));
+    }
   }
 
   i2cBusRecover();
