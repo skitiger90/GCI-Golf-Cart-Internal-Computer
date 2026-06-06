@@ -39,7 +39,12 @@
 #define ELEC_SAMPLE_INTERVAL_MS  2000    // 2s EMA tick
 #define ELEC_EMA_ALPHA           0.1f    // τ ≈ 10 samples (~20s); plateau maps 1mV→~0.057% SOC, low α needed
 #define ELEC_DEADBAND            3.0f    // min EMA deviation to update reported smoothedFuel; suppresses plateau ADC noise
-#define STARTUP_GRACE_SECS 30  // Grace period to allow GCD connection before acting on SLEEP_PIN (matches GCD)
+#define ELEC_CAL_MAX             8       // max correction table entries
+
+struct ElecCalPt { float packV; float pct; };
+
+#define STARTUP_GRACE_SECS 30    // Grace period to allow GCD connection before acting on SLEEP_PIN (matches GCD)
+#define STANDALONE_SLEEP_GRACE_SECS 300  // If no GCD peer ever connects, wait 5 min before honoring SLEEP_PIN
 #define DISPLAY_UPDATE_INTERVAL_MS 1000  // Refresh FUEL/BATT display every second regardless of telemetry state
 
 #define SLEEP_PIN 35        // LOW = sleep (ignition OFF), HIGH = awake (ignition ON)
@@ -156,6 +161,18 @@ int   fuelSampleIdx = 0;
 bool  fuelSampleFull = false;
 unsigned long lastFuelSampleTime = 0;
 float elecEma = -1.0f;  // internal EMA state for ADC_ELEC; separate from smoothedFuel to allow dead-band gating
+ElecCalPt elecCal[ELEC_CAL_MAX];  // mutable NVS-backed (packV, pct) table
+int       elecCalN = 0;
+float     elecDivider = ELEC_BATT_DIVIDER;  // runtime divider; overridden by NVS "elec_divider"
+
+// CLI state for ADC ELEC calibration
+bool cliActive      = false;
+bool cliPendingExit = false;  // true while waiting for Y/N confirmation on exit
+bool cliDirty       = false;  // true when in-memory table has unsaved changes
+char cliLineBuf[64];
+int  cliLineLen  = 0;
+bool cliLastWasCR = false;  // swallow LF that follows CR (CRLF line ending)
+unsigned long sleepGraceStartMs = 0;  // reset on boot and on CLI exit to restart the sleep grace window
 
 // Previous telemetry values for change detection
 int prevModeHeadLights = -99;
@@ -357,6 +374,7 @@ int readMCP23008Fuel() {
 
 void setup(void) {
   Serial.begin(9600);
+  Serial.println("\n=== GCI BOOT ===");
   sensors.begin();
 
   // set relay pinModes
@@ -474,6 +492,22 @@ void setup(void) {
   luxLightsOff = preferences.getInt("lux_off", 400);
   Serial.printf("Lux thresholds: on=%d off=%d\n", luxLightsOn, luxLightsOff);
 
+  // Load ELEC_CAL table from NVS; fall back to LiFePO4 16S factory curve if not present
+  {
+    int n = preferences.getInt("elec_cal_n", 0);
+    if (n > 0 && n <= ELEC_CAL_MAX) {
+      preferences.getBytes("elec_cal_pts", elecCal, n * sizeof(ElecCalPt));
+      elecCalN = n;
+    } else {
+      elecCalN   = 3;
+      elecCal[0] = {40.00f,   0.0f};   // 0%  — knee floor  (ELEC_EMPTY_V)
+      elecCal[1] = {52.00f,  25.0f};   // 25% — knee exit   (ELEC_KNEE_V)
+      elecCal[2] = {53.20f, 100.0f};   // 100% — flat plateau top (ELEC_FULL_V)
+    }
+    float nvsDivider = preferences.getFloat("elec_divider", 0.0f);
+    if (nvsDivider > 5.0f) elecDivider = nvsDivider;
+  }
+
   i2cBusRecover();
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQUENCY);
   {
@@ -539,10 +573,270 @@ void setup(void) {
     displayMacLine(tft, thisDeviceMacStr);
     displayPrLine(tft, WAITING_FOR_PAIRING, "");
   }
-  screenStartTime = millis();   // Record screen start time
+  screenStartTime = millis();
+  sleepGraceStartMs = millis();  // start sleep grace window from end of setup
 
 } /* END SETUP */
 
+
+// ---- ELEC_CAL CLI helpers ----
+
+static void sortElecCal() {
+  for (int i = 1; i < elecCalN; i++) {
+    ElecCalPt key = elecCal[i];
+    int j = i - 1;
+    while (j >= 0 && elecCal[j].packV > key.packV) { elecCal[j+1] = elecCal[j]; j--; }
+    elecCal[j+1] = key;
+  }
+}
+
+static void printElecCalTable() {
+  // Sort a display copy by pct ascending (storage order is by packV for interpolation)
+  ElecCalPt disp[ELEC_CAL_MAX];
+  memcpy(disp, elecCal, elecCalN * sizeof(ElecCalPt));
+  for (int i = 1; i < elecCalN; i++) {
+    ElecCalPt key = disp[i];
+    int j = i - 1;
+    while (j >= 0 && disp[j].pct < key.pct) { disp[j+1] = disp[j]; j--; }
+    disp[j+1] = key;
+  }
+  Serial.printf("Table (%d of %d entries):\n", elecCalN, ELEC_CAL_MAX);
+  Serial.println("  Idx   Charge   packV   adcMv");
+  for (int i = 0; i < elecCalN; i++) {
+    int adcMv = (int)(disp[i].packV / elecDivider * 1000.0f);
+    Serial.printf("  [%d]   %3.0f%%   %6.2fV   %4dmV\n",
+                  i+1, disp[i].pct, disp[i].packV, adcMv);
+  }
+}
+
+static void processCliLine(const char* line) {
+  while (*line == ' ' || *line == '\t') line++;
+
+  if (!cliActive) {
+    if (strcmp(line, "gci") == 0) {
+      cliActive = true;
+      cliDirty  = false;
+      Serial.println("\n=== Calibration for ADC ELECTRIC ===");
+      printElecCalTable();
+      Serial.println("Commands: <pct> <V>  100 <V> <adcMv>  del <Idx>  edit <Idx> <pct> <V>  show  save  exit  help");
+      Serial.print("gci> ");
+    }
+    return;
+  }
+
+  // Pending exit Y/N confirmation
+  if (cliPendingExit) {
+    if (line[0] == 'Y' || line[0] == 'y') {
+      Serial.println("Exiting. Changes discarded.");
+      cliActive      = false;
+      cliPendingExit = false;
+      cliDirty       = false;
+      sleepGraceStartMs = millis();
+    } else if (line[0] == '\0') {
+      Serial.print("Changes not saved, exit anyway (Y/N)? ");  // blank: re-ask
+    } else {
+      Serial.println("Exit cancelled.");
+      cliPendingExit = false;
+      Serial.print("gci> ");
+    }
+    return;
+  }
+
+  // blank line — ignore
+  if (line[0] == '\0') {
+    Serial.print("gci> ");
+    return;
+  }
+
+  // "help"
+  if (strcmp(line, "help") == 0) {
+    Serial.println("--- Commands ---");
+    Serial.println("  <pct> <V>             Add calibration point (charge 0-99, e.g. 85 52.50).");
+    Serial.println("                        <pct> = charge % from cart display");
+    Serial.println("                        <V>   = pack voltage from cart display");
+    Serial.println("  100 <V> <adcMv>       100% calibration entry. Computes and saves divider ratio.");
+    Serial.println("                        e.g. 100 53.20 2684");
+    Serial.println("                        <V>     = pack voltage from cart display");
+    Serial.println("                        <adcMv> = ADC reading shown on GCI display screen");
+    Serial.println("                        Both values can be noted while cart is running, entered later.");
+    Serial.println("  del <Idx>             Delete Idx (e.g. del 2).");
+    Serial.println("  edit <Idx> <pct> <V>  Fix Idx (e.g. edit 2 80 52.40).");
+    Serial.println("  show                  Re-display the calibration table.");
+  Serial.println("  save                  Save to NVS without exiting.");
+    Serial.println("  exit                  Exit. Prompts if unsaved changes exist.");
+    Serial.println("  help                  Show this help.");
+    Serial.println("--- Table columns ---");
+    Serial.println("  Charge  = charge % from cart display");
+    Serial.println("  packV   = pack voltage from cart display");
+    Serial.println("  adcMv   = expected ADC pin reading (verify against GCI screen)");
+    Serial.print("gci> ");
+    return;
+  }
+
+  // "show" — re-display the table
+  if (strcmp(line, "show") == 0) {
+    printElecCalTable();
+    Serial.print("gci> ");
+    return;
+  }
+
+  // "save" — commit to NVS, stay in CLI
+  if (strcmp(line, "save") == 0) {
+    preferences.putInt("elec_cal_n", elecCalN);
+    preferences.putBytes("elec_cal_pts", elecCal, elecCalN * sizeof(ElecCalPt));
+    cliDirty = false;
+    Serial.println("Saved.");
+    Serial.print("gci> ");
+    return;
+  }
+
+  // "exit" — exit immediately if clean, prompt if dirty
+  if (strcmp(line, "exit") == 0) {
+    if (!cliDirty) {
+      Serial.println("Exiting.");
+      cliActive = false;
+      sleepGraceStartMs = millis();
+    } else {
+      cliPendingExit = true;
+      Serial.print("Changes not saved, exit anyway (Y/N)? ");
+    }
+    return;
+  }
+
+  // "del <n>"
+  if (strncmp(line, "del ", 4) == 0) {
+    int n = atoi(line + 4);
+    if (n < 1 || n > elecCalN) {
+      Serial.printf("? Idx %d out of range (1-%d)\n", n, elecCalN);
+    } else if (fabsf(elecCal[n-1].pct - 100.0f) < 1.0f) {
+      Serial.println("? Cannot delete the 100% anchor. Use '100 <V> <adcMv>' to replace it.");
+    } else if (fabsf(elecCal[n-1].pct - 0.0f) < 1.0f) {
+      Serial.println("? Cannot delete the 0% anchor. Use '0 <V>' to replace it.");
+    } else {
+      for (int i = n-1; i < elecCalN-1; i++) elecCal[i] = elecCal[i+1];
+      elecCalN--;
+      cliDirty = true;
+      Serial.printf("Deleted Idx %d.\n", n);
+      printElecCalTable();
+    }
+    Serial.print("gci> ");
+    return;
+  }
+
+  // "edit <n> <pct> <V>"
+  if (strncmp(line, "edit ", 5) == 0) {
+    int n; float pct, packV;
+    if (sscanf(line+5, "%d %f %f", &n, &pct, &packV) == 3) {
+      if (n < 1 || n > elecCalN) {
+        Serial.printf("? Idx %d out of range (1-%d)\n", n, elecCalN);
+      } else {
+        int skipIdx = n - 1;
+        bool blocked = false;
+        for (int i = 0; i < elecCalN; i++) {
+          if (i == skipIdx) continue;
+          if (fabsf(elecCal[i].pct - pct) < 1.0f) {
+            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", i+1, elecCal[i].pct, i+1);
+            blocked = true; break;
+          }
+        }
+        if (!blocked) {
+          for (int i = 0; i < elecCalN; i++) {
+            if (i == skipIdx) continue;
+            float diff = fabsf(elecCal[i].pct - pct);
+            if (diff >= 1.0f && diff < 5.0f)
+              Serial.printf("Note: Idx [%d] at %.0f%% is only %.0f%% away.\n", i+1, elecCal[i].pct, diff);
+          }
+          elecCal[skipIdx] = {packV, pct};
+          sortElecCal();
+          cliDirty = true;
+          Serial.printf("Edited Idx %d: %.0f%% = %.2fV\n", n, pct, packV);
+          printElecCalTable();
+        }
+      }
+    } else {
+      Serial.println("? Usage: edit <Idx> <pct> <V>");
+    }
+    Serial.print("gci> ");
+    return;
+  }
+
+  // 3-token: "100 <V> <adcMv>" — calibration entry, sets divider
+  {
+    float t1, packV, adcMv;
+    if (sscanf(line, "%f %f %f", &t1, &packV, &adcMv) == 3
+            && fabsf(t1 - 100.0f) < 0.1f && packV > 10.0f && adcMv > 100.0f) {
+      if (elecCalN >= ELEC_CAL_MAX) {
+        Serial.printf("? Table full (%d max). Delete an Idx first.\n", ELEC_CAL_MAX);
+        Serial.print("gci> ");
+        return;
+      }
+      // Replace existing 100% row if present (remove it so the new entry takes its place)
+      for (int i = 0; i < elecCalN; i++) {
+        if (fabsf(elecCal[i].pct - 100.0f) < 1.0f) {
+          for (int j = i; j < elecCalN-1; j++) elecCal[j] = elecCal[j+1];
+          elecCalN--;
+          break;
+        }
+      }
+      float newDivider = packV / (adcMv / 1000.0f);
+      preferences.putFloat("elec_divider", newDivider);
+      elecDivider = newDivider;
+      elecCal[elecCalN++] = {packV, 100.0f};
+      sortElecCal();
+      cliDirty = true;
+      Serial.printf("Divider set: %.3f (saved)\n", newDivider);
+      Serial.printf("Added: 100%% = %.2fV\n", packV);
+      printElecCalTable();
+      Serial.print("gci> ");
+      return;
+    }
+  }
+
+  // 2-token: "<pct> <V>" — normal entry (pct 0–99)
+  {
+    float pct, packV;
+    if (sscanf(line, "%f %f", &pct, &packV) == 2
+            && pct >= 0.0f && pct <= 99.9f && packV > 10.0f) {
+      if (elecCalN >= ELEC_CAL_MAX) {
+        Serial.printf("? Table full (%d max). Delete an Idx first.\n", ELEC_CAL_MAX);
+        Serial.print("gci> ");
+        return;
+      }
+      // 0% anchor: replace existing row instead of blocking
+      if (pct < 1.0f) {
+        for (int i = 0; i < elecCalN; i++) {
+          if (fabsf(elecCal[i].pct - 0.0f) < 1.0f) {
+            for (int j = i; j < elecCalN-1; j++) elecCal[j] = elecCal[j+1];
+            elecCalN--;
+            break;
+          }
+        }
+      } else {
+        bool blocked = false;
+        for (int i = 0; i < elecCalN; i++) {
+          if (fabsf(elecCal[i].pct - pct) < 1.0f) {
+            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", i+1, elecCal[i].pct, i+1);
+            blocked = true; break;
+          }
+        }
+        if (blocked) { Serial.print("> "); return; }
+      }
+      for (int i = 0; i < elecCalN; i++) {
+        float diff = fabsf(elecCal[i].pct - pct);
+        if (diff >= 1.0f && diff < 5.0f)
+          Serial.printf("Note: Idx [%d] at %.0f%% is only %.0f%% away.\n", i+1, elecCal[i].pct, diff);
+      }
+      elecCal[elecCalN++] = {packV, pct};
+      sortElecCal();
+      cliDirty = true;
+      Serial.printf("Added: %.0f%% = %.2fV\n", pct, packV);
+      printElecCalTable();
+    } else {
+      Serial.println("? Commands: <pct> <V>  100 <V> <adcMv>  del <Idx>  edit <Idx> <pct> <V>  save  exit  help");
+    }
+  }
+  Serial.print("> ");
+}
 
 /**************
  *    LOOP    *
@@ -555,6 +849,10 @@ void loop() {
   static int percentFuel;
   static bool sendData = false;
   static unsigned long lastDisplayUpdateTime = 0;
+
+  // Determine peer state once per loop — used by sleep logic and telemetry
+  esp_now_peer_info_t peer;
+  bool hasPeer = (esp_now_fetch_peer(true, &peer) == ESP_OK);
 
   // Check SLEEP_PIN with debounce
   // Requires pin to be stable for SLEEP_PIN_DEBOUNCE_MS before acting
@@ -576,9 +874,10 @@ void loop() {
   // Act on SLEEP_PIN when either:
   // 1. GCD is connected (early exit - GCD has received our heartbeat and will enter GCI_MODE)
   // 2. Grace period elapsed (safeguard - sleep even if GCD never connected)
-  bool gcd_connected = (consecutiveHeartbeatsMissed < HEARTBEAT_MISS_THRESHOLD);
-  bool grace_elapsed = millis() >= (STARTUP_GRACE_SECS * 1000UL);
-  if (!enteringSleep && debounced_sleep_state && (gcd_connected || grace_elapsed)) {
+  bool gcd_connected = hasPeer && (consecutiveHeartbeatsMissed < HEARTBEAT_MISS_THRESHOLD);
+  unsigned long sleepGraceSecs = hasPeer ? STARTUP_GRACE_SECS : STANDALONE_SLEEP_GRACE_SECS;
+  bool grace_elapsed = (millis() - sleepGraceStartMs) >= (sleepGraceSecs * 1000UL);
+  if (!enteringSleep && !cliActive && debounced_sleep_state && (gcd_connected || grace_elapsed)) {
     enteringSleep = true;
     enterDeepSleep();
   }
@@ -724,10 +1023,6 @@ void loop() {
     screenOn = false;
   }
 
-  // Check if we have a paired device before attempting to send
-  esp_now_peer_info_t peer;
-  bool hasPeer = (esp_now_fetch_peer(true, &peer) == ESP_OK);
-
   // Check for heartbeat timeout and update connection status display
   static bool lastConnectionStatus = false;  // Track if we were connected last check
   bool isConnected = (consecutiveHeartbeatsMissed < HEARTBEAT_MISS_THRESHOLD);
@@ -740,11 +1035,11 @@ void loop() {
     // Set flag on first missed heartbeat for telemetry re-send
     if (consecutiveHeartbeatsMissed == 1) {
       heartbeatMissed = true;
-      Serial.println("Heartbeat missed - telemetry will be sent when connection re-established");
+      if (!cliActive) Serial.println("Heartbeat missed - telemetry will be sent when connection re-established");
     }
 
     if (consecutiveHeartbeatsMissed >= HEARTBEAT_MISS_THRESHOLD) {
-      Serial.printf("Connection lost - missed %d heartbeats\n", consecutiveHeartbeatsMissed);
+      if (!cliActive) Serial.printf("Connection lost - missed %d heartbeats\n", consecutiveHeartbeatsMissed);
     }
   }
 
@@ -807,36 +1102,22 @@ void loop() {
       }
 
       case FUEL_SENSOR_ADC_ELEC: {
-        // Calibration table: {reported battV, correction_V}
-        // correction = actual_multimeter_V - reported_battV (measured at rest, no load/charge)
-        // Keep entries in ascending battV order; 3-5 points across 40-53 V is sufficient.
-        static const struct { float battV; float corrV; } ELEC_CAL[] = {
-          {53.20f,  0.00f},   // 100% — measured 2026-06-05
-          // {52.00f,  0.00f}, // 25% knee — uncomment and fill corrV after measuring
-          // {40.00f,  0.00f}, // 0%       — uncomment and fill corrV after measuring
-        };
-        static const int ELEC_CAL_N = (int)(sizeof(ELEC_CAL) / sizeof(ELEC_CAL[0]));
-        float raw = voltsBattADC * ELEC_BATT_DIVIDER;
-        float actualBattV;
-        if (ELEC_CAL_N == 1 || raw <= ELEC_CAL[0].battV) {
-          actualBattV = raw + ELEC_CAL[0].corrV;
-        } else if (raw >= ELEC_CAL[ELEC_CAL_N-1].battV) {
-          actualBattV = raw + ELEC_CAL[ELEC_CAL_N-1].corrV;
+        float raw = voltsBattADC * elecDivider;
+        float pct;
+        if (raw <= elecCal[0].packV) {
+          pct = elecCal[0].pct;
+        } else if (raw >= elecCal[elecCalN-1].packV) {
+          pct = elecCal[elecCalN-1].pct;
         } else {
-          actualBattV = raw;
-          for (int i = 1; i < ELEC_CAL_N; i++) {
-            if (raw < ELEC_CAL[i].battV) {
-              float t = (raw - ELEC_CAL[i-1].battV) / (ELEC_CAL[i].battV - ELEC_CAL[i-1].battV);
-              actualBattV = raw + ELEC_CAL[i-1].corrV + t * (ELEC_CAL[i].corrV - ELEC_CAL[i-1].corrV);
+          pct = elecCal[elecCalN-1].pct;
+          for (int i = 1; i < elecCalN; i++) {
+            if (raw < elecCal[i].packV) {
+              float t = (raw - elecCal[i-1].packV) / (elecCal[i].packV - elecCal[i-1].packV);
+              pct = elecCal[i-1].pct + t * (elecCal[i].pct - elecCal[i-1].pct);
               break;
             }
           }
         }
-        float pct;
-        if      (actualBattV <= ELEC_EMPTY_V) pct = 0.0f;
-        else if (actualBattV <  ELEC_KNEE_V)  pct = (actualBattV - ELEC_EMPTY_V) / (ELEC_KNEE_V - ELEC_EMPTY_V) * 25.0f;
-        else if (actualBattV <  ELEC_FULL_V)  pct = 25.0f + (actualBattV - ELEC_KNEE_V) / (ELEC_FULL_V - ELEC_KNEE_V) * 75.0f;
-        else                                   pct = 100.0f;
         if (millis() - lastFuelSampleTime >= ELEC_SAMPLE_INTERVAL_MS) {
           lastFuelSampleTime = millis();
           if (elecEma < 0.0f) {
@@ -848,8 +1129,8 @@ void loop() {
               smoothedFuel = elecEma;
           }
 #if DEBUG_ADC_ELEC
-          Serial.printf("ADC_ELEC: adcMv=%d battV=%.3fV pct=%.1f%% ema=%.1f%% reported=%.1f%%\n",
-                        (int)(voltsBattADC * 1000.0f), actualBattV, pct, elecEma, smoothedFuel);
+          Serial.printf("ADC_ELEC: adcMv=%d packV=%.3fV pct=%.1f%% ema=%.1f%% reported=%.1f%%\n",
+                        (int)(voltsBattADC * 1000.0f), raw, pct, elecEma, smoothedFuel);
 #endif
         }
         break;
@@ -865,7 +1146,7 @@ void loop() {
           gpioConfirmCount = 0;
         } else if (gpioFuel == pendingGpioFuel) {
           if (++gpioConfirmCount >= GPIO_EXP_CONFIRM_COUNT) {
-            if ((float)gpioFuel != smoothedFuel)
+            if ((float)gpioFuel != smoothedFuel && !cliActive)
               Serial.printf("GPIO_EXP: confirmed fuel=%d%% (was %.0f%%)\n", gpioFuel, smoothedFuel);
             smoothedFuel    = (float)gpioFuel;
             gpioConfirmCount = GPIO_EXP_CONFIRM_COUNT; // cap to prevent overflow on long stable reads
@@ -889,12 +1170,12 @@ void loop() {
         headlightsOn = true;
         digitalWrite(RELAY1_PIN, HIGH);
         modeHeadLights = 1;
-        Serial.printf("Headlights ON after threshold update (lux=%.0f < %d)\n", luxEma, luxLightsOn);
+        if (!cliActive) Serial.printf("Headlights ON after threshold update (lux=%.0f < %d)\n", luxEma, luxLightsOn);
       } else if (luxEma >= (float)luxLightsOff && headlightsOn) {
         headlightsOn = false;
         digitalWrite(RELAY1_PIN, LOW);
         modeHeadLights = 0;
-        Serial.printf("Headlights OFF after threshold update (lux=%.0f >= %d)\n", luxEma, luxLightsOff);
+        if (!cliActive) Serial.printf("Headlights OFF after threshold update (lux=%.0f >= %d)\n", luxEma, luxLightsOff);
       }
     }
 
@@ -909,11 +1190,11 @@ void loop() {
         if (luxEma > 0.0f && luxEma < (float)luxLightsOn && !headlightsOn) {
           headlightsOn = true;
           digitalWrite(RELAY1_PIN, HIGH);
-          Serial.printf("Headlights ON (lux=%.0f < %d)\n", luxEma, luxLightsOn);
+          if (!cliActive) Serial.printf("Headlights ON (lux=%.0f < %d)\n", luxEma, luxLightsOn);
         } else if (luxEma >= (float)luxLightsOff && headlightsOn) {
           headlightsOn = false;
           digitalWrite(RELAY1_PIN, LOW);
-          Serial.printf("Headlights OFF (lux=%.0f >= %d)\n", luxEma, luxLightsOff);
+          if (!cliActive) Serial.printf("Headlights OFF (lux=%.0f >= %d)\n", luxEma, luxLightsOff);
         }
         modeHeadLights = headlightsOn ? 1 : 0;
       } else {
@@ -923,7 +1204,7 @@ void loop() {
           headlightsOn = wanted;
           digitalWrite(RELAY1_PIN, headlightsOn ? HIGH : LOW);
           modeHeadLights = headlightsOn ? 1 : 0;
-          Serial.printf("Headlights %s (is_daylight=%d)\n", headlightsOn ? "ON" : "OFF", is_daylight);
+          if (!cliActive) Serial.printf("Headlights %s (is_daylight=%d)\n", headlightsOn ? "ON" : "OFF", is_daylight);
         }
       }
       // Keep outdoorLux global in sync for telemetry packing
@@ -971,14 +1252,14 @@ void loop() {
       lastGcdSendTime = millis();
 
       if (resendAfterMissedHeartbeat) {
-        Serial.println("Telemetry sent after connection re-established");
+        if (!cliActive) Serial.println("Telemetry sent after connection re-established");
         heartbeatMissed = false;  // Clear the missed heartbeat flag
       } else {
-        Serial.println("Telemetry sent due to significant change");
+        if (!cliActive) Serial.println("Telemetry sent due to significant change");
       }
       refreshTelemetry = false;  // Clear the refresh telemetry flag
     } else if ((dataChanged || resendAfterMissedHeartbeat) && !intervalElapsed) {
-      Serial.printf("Telemetry change detected but throttled (%.1fs until next send allowed)\n",
+      if (!cliActive) Serial.printf("Telemetry change detected but throttled (%.1fs until next send allowed)\n",
                     (TELEMETRY_MIN_INTERVAL_MS - (millis() - lastGcdSendTime)) / 1000.0);
     }
   }
@@ -993,18 +1274,47 @@ void loop() {
     lastDisplayUpdateTime = millis();
   }
 
-  // Serial log only when telemetry was sent
+  // Serial log only when telemetry was sent and CLI is not active
   if (sendData) {
-    char gcdMacStr[18];
-    if (hasPeer) {
-      sprintf(gcdMacStr, "%02X:%02X:%02X:%02X:%02X:%02X",
-              peer.peer_addr[0], peer.peer_addr[1], peer.peer_addr[2],
-              peer.peer_addr[3], peer.peer_addr[4], peer.peer_addr[5]);
+    if (!cliActive) {
+      char gcdMacStr[18];
+      if (hasPeer) {
+        sprintf(gcdMacStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+                peer.peer_addr[0], peer.peer_addr[1], peer.peer_addr[2],
+                peer.peer_addr[3], peer.peer_addr[4], peer.peer_addr[5]);
+      }
+      Serial.printf("Telemetry to %s : Lights=%d, Lux=%d, Temp=%.1f, Batt=%.2f, Fuel=%.1f\n",
+                    hasPeer ? gcdMacStr : "No Peer",
+                    modeHeadLights, outdoorLux, tempF_0, voltsBattADC, smoothedFuel);
     }
-    Serial.printf("Telemetry to %s : Lights=%d, Lux=%d, Temp=%.1f, Batt=%.2f, Fuel=%.1f\n",
-                  hasPeer ? gcdMacStr : "No Peer",
-                  modeHeadLights, outdoorLux, tempF_0, voltsBattADC, smoothedFuel);
     sendData = false;
+  }
+
+  // Poll serial input for CLI trigger ("gci") and CLI commands
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') {
+      cliLastWasCR = true;
+      if (cliLineLen > 0 || cliActive) {
+        cliLineBuf[cliLineLen] = '\0';
+        processCliLine(cliLineBuf);
+      }
+      cliLineLen = 0;
+    } else if (c == '\n') {
+      if (cliLastWasCR) {
+        cliLastWasCR = false;  // swallow the LF of a CRLF pair
+      } else {
+        if (cliLineLen > 0 || cliActive) {
+          cliLineBuf[cliLineLen] = '\0';
+          processCliLine(cliLineBuf);
+        }
+        cliLineLen = 0;
+      }
+    } else {
+      cliLastWasCR = false;
+      if (cliLineLen < (int)sizeof(cliLineBuf) - 1)
+        cliLineBuf[cliLineLen++] = c;
+    }
   }
 
   delay(100); // Check every 100ms for responsive button
@@ -1224,7 +1534,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
     sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    Serial.printf("Received %s from %s\n",
+    if (!cliActive) Serial.printf("Received %s from %s\n",
                   msg->type == ESPNOW_MSG_COMMAND   ? "COMMAND" :
                   msg->type == ESPNOW_MSG_TEXT       ? "TEXT" :
                   msg->type == ESPNOW_MSG_HEARTBEAT  ? "HEARTBEAT" :
@@ -1301,14 +1611,13 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         break;
 
       case ESPNOW_MSG_TEXT:
-        Serial.print("Text message: ");
-        Serial.println((char*)msg->data);
+        if (!cliActive) { Serial.print("Text message: "); Serial.println((char*)msg->data); }
         break;
 
       case ESPNOW_MSG_HEARTBEAT:
         // Respond to heartbeat from known peer (closed-loop keepalive)
         if (esp_now_is_peer_exist(mac)) {
-          Serial.printf("Heartbeat from %s - sending response\n", mac_str);
+          if (!cliActive) Serial.printf("Heartbeat from %s - sending response\n", mac_str);
 
           // Send heartbeat response back to GCD
           espnow_message_t response;
@@ -1325,14 +1634,14 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
       case ESPNOW_MSG_IS_HOME:
         if (msg->data_len >= 1) {
           is_home = (msg->data[0] != 0);
-          Serial.printf("Received is_home status: %s\n", is_home ? "HOME" : "AWAY");
+          if (!cliActive) Serial.printf("Received is_home status: %s\n", is_home ? "HOME" : "AWAY");
         }
         break;
 
       case ESPNOW_MSG_IS_DAYTIME:
         if (msg->data_len >= 1) {
           is_daylight = (msg->data[0] != 0);
-          Serial.printf("Received is_daylight status: %s\n", is_daylight ? "DAYTIME" : "NIGHTTIME");
+          if (!cliActive) Serial.printf("Received is_daylight status: %s\n", is_daylight ? "DAYTIME" : "NIGHTTIME");
         }
         break;
 
@@ -1342,7 +1651,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
           memcpy(&cfg, msg->data, min((int)msg->data_len, (int)sizeof(cfg)));
           gciFuelSenseType = cfg.fuelSensorType;
           preferences.putInt("fuel_sense_type", gciFuelSenseType);
-          Serial.printf("Received fuel_sense_type=%d, saved to NVS\n", gciFuelSenseType);
+          if (!cliActive) Serial.printf("Received fuel_sense_type=%d, saved to NVS\n", gciFuelSenseType);
           if (gciFuelSenseType == FUEL_SENSOR_GPIO_EXP)
             initMCP23008();
           if (msg->data_len >= (int)sizeof(structMsgConfig)) {
@@ -1350,7 +1659,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
             luxLightsOff = (int)cfg.luxLightsOff;
             preferences.putInt("lux_on",  luxLightsOn);
             preferences.putInt("lux_off", luxLightsOff);
-            Serial.printf("Lux thresholds updated: on=%d off=%d\n", luxLightsOn, luxLightsOff);
+            if (!cliActive) Serial.printf("Lux thresholds updated: on=%d off=%d\n", luxLightsOn, luxLightsOff);
             luxThresholdChanged = true;
           }
         }
