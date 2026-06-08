@@ -66,7 +66,7 @@ struct ElecCalPt { float packV; float pct; };
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
 #define I2C_FREQUENCY 100000    // purposely keep at 100kHz to allow longer bus
-#define I2C_ADDR_MCP23008 0x20  // default address with all address pins grounded; can be changed by wiring address pins to VCC
+#define I2C_ADDR_MCP23008 0x27  // changed from 0x20 default to avoid other potential MCP23008 chips
 #define I2C_ADDR_BH1750 0x23    // BH1750 default address (ADDR pin grounded); can be changed to 0x5C by wiring ADDR pin to VCC
 
 #define ESPNOW_CHANNEL 1
@@ -312,13 +312,9 @@ void mcpRuntimeRecover() {
 
 // Returns mapped SOC % (25/50/75/100) or -99 on I2C failure or invalid pin state.
 // GP0=bit0 (25% sensor), GP1=bit1 (50% sensor), GP2=bit2 (75% sensor). Logic 1 = liquid present/at or above that level.
-// Holds last valid reading for up to 5 consecutive I2C failures before reporting -99.
-// Holds last valid reading for up to 2 consecutive invalid pin states (transition debounce).
 int readMCP23008Fuel() {
-  static int     lastValid     = -99;
-  static uint8_t failStreak    = 0;
-  static uint8_t invalidStreak = 0;
-  static uint8_t lastPins      = 0xFF;
+  static uint8_t failStreak = 0;
+  static uint8_t lastPins   = 0xFF;
 
   Wire.beginTransmission(I2C_ADDR_MCP23008);
   Wire.write(0x09);  // GPIO register
@@ -327,11 +323,10 @@ int readMCP23008Fuel() {
 
   if (txFail || rxFail) {
     failStreak++;
-    invalidStreak = 0;
     Serial.printf("MCP23008: I2C %s fail (streak=%d)\n", txFail ? "tx" : "rx", failStreak);
     if (failStreak == 3 || (failStreak > 3 && (failStreak - 3) % 30 == 0))
       mcpRuntimeRecover();  // full Wire.end+recover+Wire.begin+init; retries every 30 failures
-    return (failStreak >= 6) ? -99 : lastValid;  // hold for up to 5 failures before reporting -99
+    return -99;
   }
   failStreak = 0;
 
@@ -359,12 +354,7 @@ int readMCP23008Fuel() {
   else if ( gp0 && !gp1 && !gp2) result = 50;
   else if (!gp0 && !gp1 && !gp2) result = 25;
 
-  if (result == -99) {
-    invalidStreak++;
-    return (invalidStreak >= 3) ? -99 : lastValid;  // hold for up to 2 invalid reads
-  }
-  invalidStreak = 0;
-  lastValid = result;
+  if (result == -99) return -99;
   return result;
 }
 
