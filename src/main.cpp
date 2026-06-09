@@ -20,6 +20,7 @@
 #define BUTTON_HOLD_ERASE_SECS 5 // seconds to hold button to erase paired MAC
 
 #define TELEMETRY_MIN_INTERVAL_MS 5000  // Minimum 5 seconds between telemetry packets
+#define TELEMETRY_MAX_INTERVAL_MS 60000 // Maximum 60 seconds between telemetry packets (periodic refresh)
 #define HEARTBEAT_MISS_THRESHOLD 4  // Number of missed heartbeats before connection is considered lost
 
 #define FUEL_SAMPLE_COUNT       8       // rolling buffer size (8 × 15s = 2-minute window)
@@ -35,8 +36,8 @@
 // Factory default calibration: 2.690 V ADC → 53.20 V pack (100% SOC)
 #define ELEC_BATT_DIVIDER        (53.20f / 2.690f)   // = 19.777
 #define ELEC_SAMPLE_INTERVAL_MS  2000    // 2s EMA tick
-#define ELEC_EMA_ALPHA           0.1f    // τ ≈ 10 samples (~20s); plateau maps 1mV→~0.057% SOC, low α needed
-#define ELEC_DEADBAND            3.0f    // min EMA deviation to update reported smoothedFuel; suppresses plateau ADC noise
+#define ELEC_EMA_ALPHA           0.2f    // τ ≈ 5 samples (~10s); faster response while still rejecting single-sample ADC noise
+#define ELEC_DEADBAND            1.0f    // min EMA deviation to update reported smoothedFuel; suppresses plateau ADC noise
 #define ELEC_CAL_MAX             8       // max correction table entries
 // Bump ELEC_CAL_VERSION when changing factory defaults; add a new "if (calVer < N)" migration block in setup().
 #define ELEC_CAL_VERSION         1
@@ -1089,6 +1090,7 @@ void loop() {
       memcpy(verMsg.data, ver, verMsg.data_len);
       esp_now_send(peer.peer_addr, (uint8_t*)&verMsg, ESPNOW_PACKET_SIZE(verMsg.data_len));
       if (!cliActive) Serial.printf("Sent GCI version to GCD: %s\n", ver);
+      refreshTelemetry = true;
     }
   }
 
@@ -1137,7 +1139,7 @@ void loop() {
             float variance = 0.0f;
             for (int i = 0; i < count; i++) { float d = fuelSampleBuf[i] - mean; variance += d * d; }
             variance /= count;
-            if (count >= FUEL_MIN_SAMPLES && variance < FUEL_VARIANCE_THRESHOLD)
+            if (count >= FUEL_MIN_SAMPLES && (fuelSampleFull || variance < FUEL_VARIANCE_THRESHOLD))
               smoothedFuel = mean;
           }
         }
@@ -1263,8 +1265,9 @@ void loop() {
 
     // Check if minimum interval has elapsed since last send
     bool intervalElapsed = (millis() - lastGcdSendTime) >= TELEMETRY_MIN_INTERVAL_MS;
+    bool stale = (millis() - lastGcdSendTime) >= TELEMETRY_MAX_INTERVAL_MS;
 
-    if ((dataChanged || resendAfterMissedHeartbeat) && intervalElapsed) {
+    if ((dataChanged || resendAfterMissedHeartbeat || stale) && intervalElapsed) {
 
       // Update previous values
       prevBattVoltage = voltsBattADC;
@@ -1297,11 +1300,13 @@ void loop() {
       if (resendAfterMissedHeartbeat) {
         if (!cliActive) Serial.println("Telemetry sent after connection re-established");
         heartbeatMissed = false;  // Clear the missed heartbeat flag
+      } else if (stale && !dataChanged) {
+        if (!cliActive) Serial.println("Telemetry sent (periodic refresh)");
       } else {
         if (!cliActive) Serial.println("Telemetry sent due to significant change");
       }
       refreshTelemetry = false;  // Clear the refresh telemetry flag
-    } else if ((dataChanged || resendAfterMissedHeartbeat) && !intervalElapsed) {
+    } else if ((dataChanged || resendAfterMissedHeartbeat || stale) && !intervalElapsed) {
       if (!cliActive) Serial.printf("Telemetry change detected but throttled (%.1fs until next send allowed)\n",
                     (TELEMETRY_MIN_INTERVAL_MS - (millis() - lastGcdSendTime)) / 1000.0);
     }
