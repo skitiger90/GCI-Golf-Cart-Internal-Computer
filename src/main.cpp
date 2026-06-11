@@ -370,7 +370,7 @@ static void sortElecCal();  // defined after setup(); forward-declared so migrat
 
 void setup(void) {
   Serial.begin(9600);
-  Serial.println("\n=== GCI BOOT ===");
+  Serial.println("\n=== GCI BOOT " VERSION " ===");
   sensors.begin();
 
   // set relay pinModes
