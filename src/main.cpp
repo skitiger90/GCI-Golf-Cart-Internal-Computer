@@ -641,6 +641,24 @@ static int adcConflictIdx(float newPackV, int skipInternalIdx) {
   return -1;
 }
 
+// Build display (pct-descending) → array index mapping; same sort as printElecCalTable.
+static void buildDispMap(int out[]) {
+  for (int i = 0; i < elecCalN; i++) out[i] = i;
+  for (int i = 1; i < elecCalN; i++) {
+    int key = out[i]; int j = i - 1;
+    while (j >= 0 && elecCal[out[j]].pct < elecCal[key].pct) { out[j+1] = out[j]; j--; }
+    out[j+1] = key;
+  }
+}
+static int displayToArrayIdx(int n) {  // n = 1-based display index
+  int m[ELEC_CAL_MAX]; buildDispMap(m); return m[n - 1];
+}
+static int arrayToDisplayIdx(int ai) {  // array index → 1-based display index
+  int m[ELEC_CAL_MAX]; buildDispMap(m);
+  for (int i = 0; i < elecCalN; i++) if (m[i] == ai) return i + 1;
+  return -1;
+}
+
 static void printElecCalTable() {
   // Sort a display copy by pct ascending (storage order is by packV for interpolation)
   ElecCalPt disp[ELEC_CAL_MAX];
@@ -786,7 +804,7 @@ static void processCliLine(const char* line) {
   // "del <n>"
   if (strncmp(line, "del ", 4) == 0) {
     int n = atoi(line + 4);
-    int arrayIdx = elecCalN - n;  // display is descending; array is ascending
+    int arrayIdx = displayToArrayIdx(n);
     if (n < 1 || n > elecCalN) {
       Serial.printf("? Idx %d out of range (1-%d)\n", n, elecCalN);
     } else if (fabsf(elecCal[arrayIdx].pct - 100.0f) < 1.0f) {
@@ -811,12 +829,12 @@ static void processCliLine(const char* line) {
       if (n < 1 || n > elecCalN) {
         Serial.printf("? Idx %d out of range (1-%d)\n", n, elecCalN);
       } else {
-        int skipIdx = elecCalN - n;  // display is descending; array is ascending
+        int skipIdx = displayToArrayIdx(n);
         bool blocked = false;
         for (int i = 0; i < elecCalN; i++) {
           if (i == skipIdx) continue;
           if (fabsf(elecCal[i].pct - pct) < 1.0f) {
-            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", elecCalN - i, elecCal[i].pct, elecCalN - i);
+            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", arrayToDisplayIdx(i), elecCal[i].pct, arrayToDisplayIdx(i));
             blocked = true; break;
           }
         }
@@ -907,7 +925,7 @@ static void processCliLine(const char* line) {
         bool blocked = false;
         for (int i = 0; i < elecCalN; i++) {
           if (fabsf(elecCal[i].pct - pct) < 1.0f) {
-            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", elecCalN - i, elecCal[i].pct, elecCalN - i);
+            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", arrayToDisplayIdx(i), elecCal[i].pct, arrayToDisplayIdx(i));
             blocked = true; break;
           }
         }
