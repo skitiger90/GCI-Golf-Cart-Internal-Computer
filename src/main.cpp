@@ -41,6 +41,8 @@
 #define ELEC_CAL_MAX             8       // max correction table entries
 // Bump ELEC_CAL_VERSION when changing factory defaults; add a new "if (calVer < N)" migration block in setup().
 #define ELEC_CAL_VERSION         1
+#define MIN_ADC_SPACING_MV       30      // min ADC mV between adjacent cal entries (~0.6V pack); ~2× ADC noise floor
+#define ADC_ELEC_TELEM_CHANGE_PCT 2.0f   // ADC_ELEC telemetry threshold; changes <2% are within ADC noise
 
 struct ElecCalPt { float packV; float pct; };
 
@@ -620,6 +622,25 @@ static void sortElecCal() {
   }
 }
 
+// Returns internal index of entry whose packV is within MIN_ADC_SPACING_MV of newPackV, or -1 if clear.
+// skipInternalIdx: internal index to exclude (the entry being replaced); pass -1 to check all.
+static int adcConflictIdx(float newPackV, int skipInternalIdx) {
+  float newAdcMv = newPackV / elecDivider * 1000.0f;
+  int ins = elecCalN;
+  for (int i = 0; i < elecCalN; i++) {
+    if (newPackV < elecCal[i].packV) { ins = i; break; }
+  }
+  if (ins > 0 && (ins - 1) != skipInternalIdx) {
+    if (fabsf(newAdcMv - elecCal[ins-1].packV / elecDivider * 1000.0f) < MIN_ADC_SPACING_MV)
+      return ins - 1;
+  }
+  if (ins < elecCalN && ins != skipInternalIdx) {
+    if (fabsf(newAdcMv - elecCal[ins].packV / elecDivider * 1000.0f) < MIN_ADC_SPACING_MV)
+      return ins;
+  }
+  return -1;
+}
+
 static void printElecCalTable() {
   // Sort a display copy by pct ascending (storage order is by packV for interpolation)
   ElecCalPt disp[ELEC_CAL_MAX];
@@ -637,6 +658,19 @@ static void printElecCalTable() {
     Serial.printf("  [%d]   %3.0f%%   %6.2fV   %4dmV\n",
                   i+1, disp[i].pct, disp[i].packV, adcMv);
   }
+  // Flag segments that are too narrow to measure accurately — suggest a midpoint reading
+  for (int i = 1; i < elecCalN; i++) {
+    float adcSpan = (elecCal[i].packV - elecCal[i-1].packV) / elecDivider * 1000.0f;
+    if (adcSpan < 0.1f) continue;
+    float slope = fabsf(elecCal[i].pct - elecCal[i-1].pct) / adcSpan;
+    if (slope > 1.5f) {
+      float midV = (elecCal[i-1].packV + elecCal[i].packV) * 0.5f;
+      Serial.printf("Needs more data: %.0f%% @ %.2fV -> %.0f%% @ %.2fV spans only %.1fV\n",
+                    elecCal[i-1].pct, elecCal[i-1].packV, elecCal[i].pct, elecCal[i].packV,
+                    elecCal[i].packV - elecCal[i-1].packV);
+      Serial.printf("  Charge/discharge to ~%.2fV, note BMS%%, then add '<pct> %.2f'\n", midV, midV);
+    }
+  }
 }
 
 static void processCliLine(const char* line) {
@@ -648,7 +682,7 @@ static void processCliLine(const char* line) {
       cliDirty  = false;
       Serial.println("\n=== Calibration for ADC ELECTRIC ===");
       printElecCalTable();
-      Serial.println("Commands: <pct> <V>  100 <V> <adcMv>  del <Idx>  edit <Idx> <pct> <V>  show  save  exit  help");
+      Serial.println("Commands: <pct> <V>  100 <V> <adcMv>  del <Idx>  edit <Idx> <pct> <V>  show  restore  save  exit  help");
       Serial.print("gci> ");
     }
     return;
@@ -692,7 +726,8 @@ static void processCliLine(const char* line) {
     Serial.println("  del <Idx>             Delete Idx (e.g. del 2).");
     Serial.println("  edit <Idx> <pct> <V>  Fix Idx (e.g. edit 2 80 52.40).");
     Serial.println("  show                  Re-display the calibration table.");
-  Serial.println("  save                  Save to NVS without exiting.");
+    Serial.println("  restore               Reset table and divider to factory defaults.");
+    Serial.println("  save                  Save to NVS without exiting.");
     Serial.println("  exit                  Exit. Prompts if unsaved changes exist.");
     Serial.println("  help                  Show this help.");
     Serial.println("--- Table columns ---");
@@ -705,6 +740,21 @@ static void processCliLine(const char* line) {
 
   // "show" — re-display the table
   if (strcmp(line, "show") == 0) {
+    printElecCalTable();
+    Serial.print("gci> ");
+    return;
+  }
+
+  // "restore" — reset table and divider to factory defaults
+  if (strcmp(line, "restore") == 0) {
+    elecCalN   = 4;
+    elecCal[0] = {40.00f,   0.0f};
+    elecCal[1] = {48.00f,  10.0f};
+    elecCal[2] = {51.20f,  20.0f};
+    elecCal[3] = {53.20f, 100.0f};
+    elecDivider = ELEC_BATT_DIVIDER;
+    cliDirty = true;
+    Serial.println("Table reset to factory defaults. Type 'save' to commit.");
     printElecCalTable();
     Serial.print("gci> ");
     return;
@@ -736,14 +786,15 @@ static void processCliLine(const char* line) {
   // "del <n>"
   if (strncmp(line, "del ", 4) == 0) {
     int n = atoi(line + 4);
+    int arrayIdx = elecCalN - n;  // display is descending; array is ascending
     if (n < 1 || n > elecCalN) {
       Serial.printf("? Idx %d out of range (1-%d)\n", n, elecCalN);
-    } else if (fabsf(elecCal[n-1].pct - 100.0f) < 1.0f) {
+    } else if (fabsf(elecCal[arrayIdx].pct - 100.0f) < 1.0f) {
       Serial.println("? Cannot delete the 100% anchor. Use '100 <V> <adcMv>' to replace it.");
-    } else if (fabsf(elecCal[n-1].pct - 0.0f) < 1.0f) {
+    } else if (fabsf(elecCal[arrayIdx].pct - 0.0f) < 1.0f) {
       Serial.println("? Cannot delete the 0% anchor. Use '0 <V>' to replace it.");
     } else {
-      for (int i = n-1; i < elecCalN-1; i++) elecCal[i] = elecCal[i+1];
+      for (int i = arrayIdx; i < elecCalN-1; i++) elecCal[i] = elecCal[i+1];
       elecCalN--;
       cliDirty = true;
       Serial.printf("Deleted Idx %d.\n", n);
@@ -760,27 +811,28 @@ static void processCliLine(const char* line) {
       if (n < 1 || n > elecCalN) {
         Serial.printf("? Idx %d out of range (1-%d)\n", n, elecCalN);
       } else {
-        int skipIdx = n - 1;
+        int skipIdx = elecCalN - n;  // display is descending; array is ascending
         bool blocked = false;
         for (int i = 0; i < elecCalN; i++) {
           if (i == skipIdx) continue;
           if (fabsf(elecCal[i].pct - pct) < 1.0f) {
-            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", i+1, elecCal[i].pct, i+1);
+            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", elecCalN - i, elecCal[i].pct, elecCalN - i);
             blocked = true; break;
           }
         }
         if (!blocked) {
-          for (int i = 0; i < elecCalN; i++) {
-            if (i == skipIdx) continue;
-            float diff = fabsf(elecCal[i].pct - pct);
-            if (diff >= 1.0f && diff < 5.0f)
-              Serial.printf("Note: Idx [%d] at %.0f%% is only %.0f%% away.\n", i+1, elecCal[i].pct, diff);
+          int ci = adcConflictIdx(packV, skipIdx);
+          if (ci >= 0) {
+            Serial.printf("? %.2fV is %.2fV from existing %.0f%% @ %.2fV — entries need >=0.6V spacing.\n",
+                          packV, fabsf(packV - elecCal[ci].packV), elecCal[ci].pct, elecCal[ci].packV);
+            Serial.println("  Run 'show', then: edit <Idx> <pct> <V>  or  del <Idx> then re-add.");
+          } else {
+            elecCal[skipIdx] = {packV, pct};
+            sortElecCal();
+            cliDirty = true;
+            Serial.printf("Edited Idx %d: %.0f%% = %.2fV\n", n, pct, packV);
+            printElecCalTable();
           }
-          elecCal[skipIdx] = {packV, pct};
-          sortElecCal();
-          cliDirty = true;
-          Serial.printf("Edited Idx %d: %.0f%% = %.2fV\n", n, pct, packV);
-          printElecCalTable();
         }
       }
     } else {
@@ -811,6 +863,16 @@ static void processCliLine(const char* line) {
       float newDivider = packV / (adcMv / 1000.0f);
       preferences.putFloat("elec_divider", newDivider);
       elecDivider = newDivider;
+      {
+        int ci = adcConflictIdx(packV, -1);
+        if (ci >= 0) {
+          Serial.printf("? %.2fV is %.2fV from existing %.0f%% @ %.2fV — entries need >=0.6V spacing.\n",
+                        packV, fabsf(packV - elecCal[ci].packV), elecCal[ci].pct, elecCal[ci].packV);
+          Serial.println("  Run 'show', then: del <Idx> to remove the conflicting entry, then retry.");
+          Serial.print("gci> ");
+          return;
+        }
+      }
       elecCal[elecCalN++] = {packV, 100.0f};
       sortElecCal();
       cliDirty = true;
@@ -845,16 +907,21 @@ static void processCliLine(const char* line) {
         bool blocked = false;
         for (int i = 0; i < elecCalN; i++) {
           if (fabsf(elecCal[i].pct - pct) < 1.0f) {
-            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", i+1, elecCal[i].pct, i+1);
+            Serial.printf("? Idx [%d] already at %.0f%%. Use 'del %d' to replace it.\n", elecCalN - i, elecCal[i].pct, elecCalN - i);
             blocked = true; break;
           }
         }
         if (blocked) { Serial.print("> "); return; }
       }
-      for (int i = 0; i < elecCalN; i++) {
-        float diff = fabsf(elecCal[i].pct - pct);
-        if (diff >= 1.0f && diff < 5.0f)
-          Serial.printf("Note: Idx [%d] at %.0f%% is only %.0f%% away.\n", i+1, elecCal[i].pct, diff);
+      {
+        int ci = adcConflictIdx(packV, -1);
+        if (ci >= 0) {
+          Serial.printf("? %.2fV is %.2fV from existing %.0f%% @ %.2fV — entries need >=0.6V spacing.\n",
+                        packV, fabsf(packV - elecCal[ci].packV), elecCal[ci].pct, elecCal[ci].packV);
+          Serial.println("  Run 'show', then: edit <Idx> <pct> <V>  or  del <Idx> then re-add.");
+          Serial.print("gci> ");
+          return;
+        }
       }
       elecCal[elecCalN++] = {packV, pct};
       sortElecCal();
@@ -862,7 +929,7 @@ static void processCliLine(const char* line) {
       Serial.printf("Added: %.0f%% = %.2fV\n", pct, packV);
       printElecCalTable();
     } else {
-      Serial.println("? Commands: <pct> <V>  100 <V> <adcMv>  del <Idx>  edit <Idx> <pct> <V>  save  exit  help");
+      Serial.println("? Commands: <pct> <V>  100 <V> <adcMv>  del <Idx>  edit <Idx> <pct> <V>  show  restore  save  exit  help");
     }
   }
   Serial.print("> ");
@@ -1393,8 +1460,9 @@ bool hasSignificantTelemetryChange(float battVolts, float airTemp, float fuel, i
     changed = true;
   }
 
-  // Check fuel level change (>1%)
-  if (fabs(fuel - prevFuelLevel) > 1.0) {
+  // Check fuel level change; ADC_ELEC uses a higher threshold since sub-2% changes are within ADC noise
+  float fuelThresh = (gciFuelSenseType == FUEL_SENSOR_ADC_ELEC) ? ADC_ELEC_TELEM_CHANGE_PCT : 1.0f;
+  if (fabs(fuel - prevFuelLevel) > fuelThresh) {
     Serial.printf("Fuel level changed: %.1f%% -> %.1f%% (delta: %.1f%%)\n",
                   prevFuelLevel, fuel, fabs(fuel - prevFuelLevel));
     changed = true;
