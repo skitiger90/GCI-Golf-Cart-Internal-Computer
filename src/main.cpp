@@ -16,7 +16,6 @@
 #include "version.h"
 
 #define SCREEN_TIMEOUT 120 // seconds
-#define PAIRED_MAC_MSG_TIMEOUT 5 // seconds
 #define BUTTON_HOLD_ERASE_SECS 5 // seconds to hold button to erase paired MAC
 
 #define TELEMETRY_MIN_INTERVAL_MS 5000  // Minimum 5 seconds between telemetry packets
@@ -151,8 +150,6 @@ unsigned long lastHeartbeatCheckTime = 0;
 // variables for outbound data
 int modeHeadLights = -99;
 int outdoorLux = -99;
-float airTemperature = -99;
-float battVoltage = -99;
 
 // Fuel sensor type (loaded from NVS, updated via ESPNOW_MSG_CONFIG from GCD)
 int gciFuelSenseType = FUEL_SENSOR_ADC_GAS;
@@ -218,8 +215,6 @@ typedef struct struct_msg_to_gcd {
 structMsgToGcd dataToGcd;
 
 // variables for inbound data
-int cmdFromGcd;
-
 typedef struct struct_msg_from_gcd {
   int cmdNumber;
   uint8_t macAddr[6];  // For pairing command and future use
@@ -227,9 +222,6 @@ typedef struct struct_msg_from_gcd {
 
 structMsgFromGcd dataFromGcd;
 
-esp_now_peer_info_t peerInfo;
-
-String tx_success;   // Variable to store if sending data was successful
 
 
 // Bit-bang 9 SCL pulses + STOP before Wire.begin() to release any I2C slave
@@ -1575,12 +1567,6 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     // Transient and expected — no retry needed.
     Serial.println("Send Status: Fail");
   }
-  if (status ==0){
-    tx_success = "Delivery Success :)";
-  }
-  else{
-    tx_success = "Delivery Fail :(";
-  }
 }
 
 // Callback when data is received (promiscuous mode for pairing)
@@ -1683,7 +1669,6 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         memcpy(&dataFromGcd, msg->data, sizeof(dataFromGcd));
         Serial.print("Command: ");
         Serial.println(dataFromGcd.cmdNumber);
-        cmdFromGcd = dataFromGcd.cmdNumber;
 
         // Process commands
         switch (dataFromGcd.cmdNumber) {
